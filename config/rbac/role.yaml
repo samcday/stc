@@ -1,0 +1,33 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  creationTimestamp: null
+  name: manager-role
+rules:
+- apiGroups:
+  - stc.samcday.com
+  resources:
+  - syncthingclusters
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - stc.samcday.com
+  resources:
+  - syncthingclusters/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - stc.samcday.com
+  resources:
+  - syncthingclusters/status
+  verbs:
+  - get
+  - patch
+  - update
