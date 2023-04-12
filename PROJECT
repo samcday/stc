@@ -1,0 +1,7 @@
+componentConfig: true
+domain: stc.samcday.com
+layout:
+- go.kubebuilder.io/v3
+projectName: stc
+repo: github.com/samcday/stc
+version: "3"
