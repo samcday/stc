@@ -4,4 +4,13 @@ layout:
 - go.kubebuilder.io/v3
 projectName: stc
 repo: github.com/samcday/stc
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: stc.samcday.com
+  kind: SyncthingCluster
+  path: github.com/samcday/stc/api/v1alpha1
+  version: v1alpha1
 version: "3"

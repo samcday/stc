@@ -1,0 +1,31 @@
+# permissions for end users to edit syncthingclusters.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: clusterrole
+    app.kubernetes.io/instance: syncthingcluster-editor-role
+    app.kubernetes.io/component: rbac
+    app.kubernetes.io/created-by: stc
+    app.kubernetes.io/part-of: stc
+    app.kubernetes.io/managed-by: kustomize
+  name: syncthingcluster-editor-role
+rules:
+- apiGroups:
+  - stc.samcday.com
+  resources:
+  - syncthingclusters
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - stc.samcday.com
+  resources:
+  - syncthingclusters/status
+  verbs:
+  - get

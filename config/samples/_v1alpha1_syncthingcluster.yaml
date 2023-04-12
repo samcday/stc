@@ -1,0 +1,12 @@
+apiVersion: stc.samcday.com/v1alpha1
+kind: SyncthingCluster
+metadata:
+  labels:
+    app.kubernetes.io/name: syncthingcluster
+    app.kubernetes.io/instance: syncthingcluster-sample
+    app.kubernetes.io/part-of: stc
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/created-by: stc
+  name: syncthingcluster-sample
+spec:
+  # TODO(user): Add fields here
