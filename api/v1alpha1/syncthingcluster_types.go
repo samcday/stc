@@ -25,15 +25,20 @@ type SyncthingClusterSpec struct {
 	PodSpec corev1.PodSpec `json:"podSpec,omitempty"`
 }
 
+type SyncthingClusterStatusNodeDevice struct {
+}
+
 type SyncthingClusterStatusNode struct {
-	Connected bool   `json:"connected"`
-	DeviceID  string `json:"deviceID,omitempty"`
-	Version   string `json:"version,omitempty"`
+	Connected bool                   `json:"connected"`
+	DeviceID  string                 `json:"deviceID,omitempty"`
+	Version   string                 `json:"version,omitempty"`
+	Devices   map[string]metav1.Time `json:"devices,omitempty"`
+	Folders   map[string]metav1.Time `json:"folders,omitempty"`
 }
 
 type SyncthingClusterStatus struct {
-	Conditions []metav1.Condition                    `json:"conditions,omitempty"`
-	Nodes      map[string]SyncthingClusterStatusNode `json:"nodes,omitempty"`
+	Conditions []metav1.Condition                     `json:"conditions,omitempty"`
+	Nodes      map[string]*SyncthingClusterStatusNode `json:"nodes,omitempty"`
 }
 
 //+kubebuilder:object:root=true

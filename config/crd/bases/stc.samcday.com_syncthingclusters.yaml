@@ -7003,6 +7003,16 @@ spec:
                       type: boolean
                     deviceID:
                       type: string
+                    devices:
+                      additionalProperties:
+                        format: date-time
+                        type: string
+                      type: object
+                    folders:
+                      additionalProperties:
+                        format: date-time
+                        type: string
+                      type: object
                     version:
                       type: string
                   required:

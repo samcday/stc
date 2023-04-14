@@ -104,35 +104,66 @@ func (r *SyncthingClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	isReady := true
 
-	c.Status.Nodes = make(map[string]stc.SyncthingClusterStatusNode)
+	c.Status.Nodes = make(map[string]*stc.SyncthingClusterStatusNode)
 	for _, pod := range pods.Items {
+		wasReady := isReady
+		isReady = false
+
 		var versionResp struct {
 			Version string `json:"version,omitempty"`
 		}
 		var statusResp struct {
 			ID string `json:"myID,omitempty"`
 		}
+		var deviceResp map[string]struct {
+			LastSeen metav1.Time `json:"lastSeen"`
+		}
+		var folderResp map[string]struct {
+			LastScan metav1.Time `json:"lastScan"`
+		}
 
-		failed := false
-		err = r.stAPI(pod.Status.PodIP, "system/version", &versionResp)
+		ip := pod.Status.PodIP
+
+		nodeStatus := &stc.SyncthingClusterStatusNode{
+			Connected: false,
+			Devices:   map[string]metav1.Time{},
+			Folders:   map[string]metav1.Time{},
+		}
+		c.Status.Nodes[pod.Spec.NodeName] = nodeStatus
+
+		err = r.stAPI(ip, "system/version", &versionResp)
 		if err != nil {
-			failed = true
+			continue
 		}
+		nodeStatus.Version = versionResp.Version
 
-		err = r.stAPI(pod.Status.PodIP, "system/status", &statusResp)
+		err = r.stAPI(ip, "system/status", &statusResp)
 		if err != nil {
-			failed = true
+			continue
+		}
+		nodeStatus.DeviceID = statusResp.ID
+
+		err = r.stAPI(ip, "stats/device", &deviceResp)
+		if err != nil {
+			continue
+		}
+		for k, v := range deviceResp {
+			if k == nodeStatus.DeviceID {
+				continue
+			}
+			nodeStatus.Devices[k] = v.LastSeen
 		}
 
-		if failed {
-			isReady = false
+		err = r.stAPI(ip, "stats/folder", &folderResp)
+		if err != nil {
+			continue
+		}
+		for k, v := range folderResp {
+			nodeStatus.Folders[k] = v.LastScan
 		}
 
-		c.Status.Nodes[pod.Spec.NodeName] = stc.SyncthingClusterStatusNode{
-			Connected: !failed,
-			DeviceID:  statusResp.ID,
-			Version:   versionResp.Version,
-		}
+		nodeStatus.Connected = true
+		isReady = wasReady
 	}
 
 	if isDeleted {
@@ -141,12 +172,11 @@ func (r *SyncthingClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, r.updateReadiness(ctx, &c, false, "Deleting", "Cluster is being deleted (TODO, manually remove the finalizer for now)")
 	}
 
-	if dsReady && isReady {
+	if isReady {
 		return ctrl.Result{RequeueAfter: time.Minute}, r.updateReadiness(ctx, &c, true, "Reconciled", "Cluster is online and configured.")
-	} else if dsReady && !isReady {
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, r.updateReadiness(ctx, &c, true, "Waiting", "Waiting for all cluster peers to become ready...")
+	} else {
+		return ctrl.Result{RequeueAfter: time.Second}, r.updateReadiness(ctx, &c, true, "Waiting", "Waiting for all cluster peers to become ready...")
 	}
-	return ctrl.Result{}, nil
 }
 
 func (r *SyncthingClusterReconciler) stAPI(ip, path string, out interface{}) error {
