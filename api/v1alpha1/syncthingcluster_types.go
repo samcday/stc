@@ -25,15 +25,15 @@ type SyncthingClusterSpec struct {
 	PodSpec corev1.PodSpec `json:"podSpec,omitempty"`
 }
 
-type SyncthingClusterStatusNodeDevice struct {
-}
-
 type SyncthingClusterStatusNode struct {
-	Connected bool                   `json:"connected"`
-	DeviceID  string                 `json:"deviceID,omitempty"`
-	Version   string                 `json:"version,omitempty"`
-	Devices   map[string]metav1.Time `json:"devices,omitempty"`
-	Folders   map[string]metav1.Time `json:"folders,omitempty"`
+	DeviceID      string                 `json:"deviceID,omitempty"`
+	Devices       map[string]metav1.Time `json:"devices,omitempty"`
+	LastError     string                 `json:"lastError,omitempty"`
+	LastErrorTime metav1.Time            `json:"lastErrorTime,omitempty"`
+	Folders       map[string]metav1.Time `json:"folders,omitempty"`
+	Online        bool                   `json:"online"`
+	Ready         bool                   `json:"ready"`
+	Version       string                 `json:"version,omitempty"`
 }
 
 type SyncthingClusterStatus struct {

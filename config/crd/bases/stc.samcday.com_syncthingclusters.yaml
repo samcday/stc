@@ -6999,8 +6999,6 @@ spec:
               nodes:
                 additionalProperties:
                   properties:
-                    connected:
-                      type: boolean
                     deviceID:
                       type: string
                     devices:
@@ -7013,10 +7011,20 @@ spec:
                         format: date-time
                         type: string
                       type: object
+                    lastError:
+                      type: string
+                    lastErrorTime:
+                      format: date-time
+                      type: string
+                    online:
+                      type: boolean
+                    ready:
+                      type: boolean
                     version:
                       type: string
                   required:
-                  - connected
+                  - online
+                  - ready
                   type: object
                 type: object
             type: object

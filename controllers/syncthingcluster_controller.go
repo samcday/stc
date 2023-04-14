@@ -17,22 +17,28 @@ limitations under the License.
 package controllers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/go-logr/logr"
+	"github.com/pkg/errors"
 	stc "github.com/samcday/stc/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"net/http"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/log"
+	klog "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"strings"
 	"time"
 )
 
@@ -60,13 +66,12 @@ const finalizerName = "stc.samcday.com/finalizer"
 //+kubebuilder:rbac:groups=apps,resources=daemonsets,verbs=get;list;watch;create;update;patch;delete
 
 func (r *SyncthingClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := log.FromContext(ctx).WithValues("name", req.Name)
+	log := klog.FromContext(ctx)
 
 	var c stc.SyncthingCluster
 	err := r.Client.Get(ctx, req.NamespacedName, &c)
 	if err != nil {
-		log.Error(err, "failed to get SyncthingCluster")
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		return ctrl.Result{}, errors.Wrap(client.IgnoreNotFound(err), "failed to get SyncthingCluster")
 	}
 
 	hasFinalizer := controllerutil.ContainsFinalizer(&c, finalizerName)
@@ -77,16 +82,18 @@ func (r *SyncthingClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, nil
 	}
 
-	dsReady, err := r.ensureDaemonSet(ctx, req, &c)
+	dsReady, err := r.ensureDaemonSet(log, ctx, req, &c)
 	if err != nil {
-		return ctrl.Result{}, err
+		return ctrl.Result{}, errors.Wrapf(err, "failed to reconcile DaemonSet for '%s'", req.Name)
 	}
 
 	if !hasFinalizer {
 		// Cluster is not being deleted, but does not yet have finalizer. Add it now.
 		controllerutil.AddFinalizer(&c, finalizerName)
-		if err := r.Update(ctx, &c); err != nil {
-			return ctrl.Result{}, err
+		log.V(1).Info("adding finalizer")
+		err := r.Update(ctx, &c)
+		if err != nil {
+			return ctrl.Result{}, errors.Wrapf(err, "failed to add finalizer to '%s'", req.Name)
 		}
 	}
 
@@ -99,98 +106,78 @@ func (r *SyncthingClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	var pods corev1.PodList
 	err = r.List(ctx, &pods, client.InNamespace(req.Namespace), client.MatchingFields{"daemonset-owner": req.Name})
 	if err != nil {
-		return ctrl.Result{}, err
+		return ctrl.Result{}, errors.Wrap(err, "failed to list pods")
 	}
 
 	isReady := true
 
+	nodesByIP := make(map[string]*stc.SyncthingClusterStatusNode)
+
 	c.Status.Nodes = make(map[string]*stc.SyncthingClusterStatusNode)
 	for _, pod := range pods.Items {
-		wasReady := isReady
-		isReady = false
-
-		var versionResp struct {
-			Version string `json:"version,omitempty"`
-		}
-		var statusResp struct {
-			ID string `json:"myID,omitempty"`
-		}
-		var deviceResp map[string]struct {
-			LastSeen metav1.Time `json:"lastSeen"`
-		}
-		var folderResp map[string]struct {
-			LastScan metav1.Time `json:"lastScan"`
-		}
-
 		ip := pod.Status.PodIP
-
-		nodeStatus := &stc.SyncthingClusterStatusNode{
-			Connected: false,
-			Devices:   map[string]metav1.Time{},
-			Folders:   map[string]metav1.Time{},
-		}
+		nodeStatus, err := r.syncthingStatus(ip)
+		nodesByIP[ip] = nodeStatus
 		c.Status.Nodes[pod.Spec.NodeName] = nodeStatus
-
-		err = r.stAPI(ip, "system/version", &versionResp)
 		if err != nil {
+			isReady = false
+			nodeStatus.LastErrorTime = metav1.NewTime(time.Now())
+			nodeStatus.LastError = err.Error()
 			continue
 		}
-		nodeStatus.Version = versionResp.Version
-
-		err = r.stAPI(ip, "system/status", &statusResp)
-		if err != nil {
-			continue
-		}
-		nodeStatus.DeviceID = statusResp.ID
-
-		err = r.stAPI(ip, "stats/device", &deviceResp)
-		if err != nil {
-			continue
-		}
-		for k, v := range deviceResp {
-			if k == nodeStatus.DeviceID {
-				continue
-			}
-			nodeStatus.Devices[k] = v.LastSeen
-		}
-
-		err = r.stAPI(ip, "stats/folder", &folderResp)
-		if err != nil {
-			continue
-		}
-		for k, v := range folderResp {
-			nodeStatus.Folders[k] = v.LastScan
-		}
-
-		nodeStatus.Connected = true
-		isReady = wasReady
-	}
-
-	if isDeleted {
-		// Check that Syncthing cluster is empty before removing the finalizer.
-		// TODO: implement
-		return ctrl.Result{}, r.updateReadiness(ctx, &c, false, "Deleting", "Cluster is being deleted (TODO, manually remove the finalizer for now)")
 	}
 
 	if isReady {
-		return ctrl.Result{RequeueAfter: time.Minute}, r.updateReadiness(ctx, &c, true, "Reconciled", "Cluster is online and configured.")
-	} else {
-		return ctrl.Result{RequeueAfter: time.Second}, r.updateReadiness(ctx, &c, true, "Waiting", "Waiting for all cluster peers to become ready...")
+		// All Syncthing instances are running and appear healthy. Ensure they are configured according to spec.
+		for ip, nodeStatus := range nodesByIP {
+			err := r.ensureSyncthingConfig(log, ip, &c)
+			if err != nil {
+				isReady = false
+				nodeStatus.LastErrorTime = metav1.NewTime(time.Now())
+				nodeStatus.LastError = err.Error()
+				continue
+			}
+			nodeStatus.Ready = true
+		}
 	}
-}
 
-func (r *SyncthingClusterReconciler) stAPI(ip, path string, out interface{}) error {
-	resp, err := r.stClient.Get(fmt.Sprintf("http://%s:8384/rest/%s", ip, path))
+	if isDeleted {
+		// TODO: Check that Syncthing cluster is empty before removing the finalizer.
+		return ctrl.Result{}, r.updateReadiness(log, ctx, &c, false, "Deleting", "Cluster is being deleted (TODO, manually remove the finalizer for now)")
+	}
+
+	reason := "Waiting"
+	message := "Waiting for all cluster peers to become ready..."
+	result := reconcile.Result{RequeueAfter: 5 * time.Second}
+
+	if isReady {
+		reason = "Reconciled"
+		message = "Cluster is online and configured."
+		result = reconcile.Result{RequeueAfter: time.Minute}
+	}
+
+	err = r.updateReadiness(log, ctx, &c, isReady, reason, message)
 	if err != nil {
-		return err
+		return reconcile.Result{}, errors.Wrap(err, "failed to update readiness")
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	return result, nil
 }
 
-func (r *SyncthingClusterReconciler) ensureDaemonSet(ctx context.Context, req reconcile.Request, c *stc.SyncthingCluster) (bool, error) {
+func (r *SyncthingClusterReconciler) stAPI(ip, path string, out interface{}) (resp *http.Response, err error) {
+	resp, err = r.stClient.Get(fmt.Sprintf("http://%s:8384/rest/%s", ip, path))
+	if err != nil {
+		return
+	}
+	if strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
+		err = json.NewDecoder(resp.Body).Decode(out)
+	}
+	return
+}
+
+func (r *SyncthingClusterReconciler) ensureDaemonSet(log logr.Logger, ctx context.Context, req reconcile.Request, c *stc.SyncthingCluster) (bool, error) {
 	var ds appsv1.DaemonSet
 	err := r.Client.Get(ctx, req.NamespacedName, &ds)
-	if err != nil && !errors.IsNotFound(err) {
+	if err != nil && !k8serr.IsNotFound(err) {
 		return false, err
 	}
 
@@ -199,7 +186,7 @@ func (r *SyncthingClusterReconciler) ensureDaemonSet(ctx context.Context, req re
 
 	owner := metav1.GetControllerOf(&ds)
 	if dsExists && (owner == nil || owner.APIVersion != stc.GroupVersion.String() || owner.Kind != c.Kind) {
-		return false, r.updateReadiness(ctx, c, false,
+		return false, r.updateReadiness(log, ctx, c, false,
 			"Error", fmt.Sprintf("An unmanaged DaemonSet with the name '%s' already exists", req.Name))
 	}
 
@@ -319,25 +306,124 @@ func (r *SyncthingClusterReconciler) ensureDaemonSet(ctx context.Context, req re
 
 	dss := ds.Status
 	if dss.ObservedGeneration < ds.Generation || dss.NumberReady < dss.DesiredNumberScheduled || dss.UpdatedNumberScheduled < dss.DesiredNumberScheduled {
-		return false, r.updateReadiness(ctx, c, false, "DaemonSetNotUpToDate", "DaemonSet has not fully rolled out yet")
+		return false, r.updateReadiness(log, ctx, c, false, "DaemonSetNotUpToDate", "DaemonSet has not fully rolled out yet")
 	}
 
 	return true, nil
 }
 
-func (r *SyncthingClusterReconciler) updateReadiness(ctx context.Context, c *stc.SyncthingCluster, isReady bool, reason, message string) error {
+func (r *SyncthingClusterReconciler) updateReadiness(log logr.Logger, ctx context.Context, c *stc.SyncthingCluster, isReady bool, reason, message string) error {
 	readyStatus := metav1.ConditionFalse
 	if isReady {
 		readyStatus = metav1.ConditionTrue
 	}
 	meta.SetStatusCondition(&c.Status.Conditions, metav1.Condition{
-		Type:    "Ready",
-		Status:  readyStatus,
-		Reason:  reason,
-		Message: message,
+		Type:               "Ready",
+		Status:             readyStatus,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: c.Generation,
 	})
-
+	log.V(1).Info("updating readiness", "status", readyStatus, "message", message, "reason", reason)
 	return r.Status().Update(ctx, c)
+}
+
+func (r *SyncthingClusterReconciler) syncthingStatus(ip string) (nodeStatus *stc.SyncthingClusterStatusNode, err error) {
+	var versionResp struct {
+		Version string `json:"version,omitempty"`
+	}
+	var statusResp struct {
+		ID string `json:"myID,omitempty"`
+	}
+	var deviceResp map[string]struct {
+		LastSeen metav1.Time `json:"lastSeen"`
+	}
+	var folderResp map[string]struct {
+		LastScan metav1.Time `json:"lastScan"`
+	}
+
+	nodeStatus = &stc.SyncthingClusterStatusNode{
+		Devices: map[string]metav1.Time{},
+		Folders: map[string]metav1.Time{},
+	}
+
+	_, err = r.stAPI(ip, "system/version", &versionResp)
+	if err != nil {
+		return
+	}
+	nodeStatus.Online = true
+	nodeStatus.Version = versionResp.Version
+
+	_, err = r.stAPI(ip, "system/status", &statusResp)
+	if err != nil {
+		return
+	}
+	nodeStatus.DeviceID = statusResp.ID
+
+	_, err = r.stAPI(ip, "stats/device", &deviceResp)
+	if err != nil {
+		return
+	}
+	for k, v := range deviceResp {
+		if k == nodeStatus.DeviceID {
+			continue
+		}
+		nodeStatus.Devices[k] = v.LastSeen
+	}
+
+	_, err = r.stAPI(ip, "stats/folder", &folderResp)
+	if err != nil {
+		return
+	}
+	for k, v := range folderResp {
+		nodeStatus.Folders[k] = v.LastScan
+	}
+
+	return
+}
+
+type stDeviceConfig struct {
+	DeviceID string `json:"deviceID"`
+	Name     string `json:"name"`
+}
+
+func (r *SyncthingClusterReconciler) ensureSyncthingConfig(log logr.Logger, ip string, c *stc.SyncthingCluster) error {
+	var updateDevices []stDeviceConfig
+
+	for nodeName, nodeStatus := range c.Status.Nodes {
+		var cfg stDeviceConfig
+		_, err := r.stAPI(ip, "config/devices/"+nodeStatus.DeviceID, &cfg)
+		if err != nil {
+			return fmt.Errorf("config/devices lookup failed: %v", err)
+		}
+
+		if cfg.DeviceID != nodeStatus.DeviceID || cfg.Name != nodeName {
+			cfg.Name = nodeName
+			cfg.DeviceID = nodeStatus.DeviceID
+			updateDevices = append(updateDevices, cfg)
+		}
+	}
+
+	if len(updateDevices) > 0 {
+		log.V(1).Info("Updating devices", "ip", ip, "count", len(updateDevices))
+		body, err := json.Marshal(updateDevices)
+		if err != nil {
+			return err
+		}
+		req, err := http.NewRequest("PUT", fmt.Sprintf("http://%s:8384/rest/config/devices", ip), bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := r.stClient.Do(req)
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode != 200 {
+			return fmt.Errorf("device update HTTP error: %d", resp.StatusCode)
+		}
+	}
+	return nil
 }
 
 func (r *SyncthingClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -360,7 +446,7 @@ func (r *SyncthingClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&stc.SyncthingCluster{}).
+		For(&stc.SyncthingCluster{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&appsv1.DaemonSet{}).
 		Complete(r)
 }
