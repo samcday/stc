@@ -20,7 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	stcsamcdaycomv1alpha1 "github.com/samcday/stc/api/v1alpha1"
+	stc "github.com/samcday/stc/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -32,11 +32,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"time"
 )
 
 type SyncthingClusterReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme   *runtime.Scheme
+	stClient *http.Client
 }
 
 type SyncthingRestTransport struct {
@@ -59,7 +62,7 @@ const finalizerName = "stc.samcday.com/finalizer"
 func (r *SyncthingClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx).WithValues("name", req.Name)
 
-	var c stcsamcdaycomv1alpha1.SyncthingCluster
+	var c stc.SyncthingCluster
 	err := r.Client.Get(ctx, req.NamespacedName, &c)
 	if err != nil {
 		log.Error(err, "failed to get SyncthingCluster")
@@ -70,47 +73,13 @@ func (r *SyncthingClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	isDeleted := !c.ObjectMeta.DeletionTimestamp.IsZero()
 
 	if isDeleted && !hasFinalizer {
-		// This object is in the process of being deleted, and does not have our finalizer.
-		// Nothing to do here.
+		// This object is being deleted, and does not have our finalizer. Nothing to do here.
 		return ctrl.Result{}, nil
 	}
 
-	var ds appsv1.DaemonSet
-	err = r.Client.Get(ctx, req.NamespacedName, &ds)
-	if err != nil && !errors.IsNotFound(err) {
+	dsReady, err := r.ensureDaemonSet(ctx, req, &c)
+	if err != nil {
 		return ctrl.Result{}, err
-	}
-
-	dsPatch := client.MergeFrom(ds.DeepCopy())
-	dsExists := ds.Name != ""
-
-	owner := metav1.GetControllerOf(&ds)
-	if dsExists && (owner == nil || owner.APIVersion != stcsamcdaycomv1alpha1.GroupVersion.String() || owner.Kind != c.Kind) {
-		// TODO: handle this properly.
-		return ctrl.Result{}, fmt.Errorf("an unmanaged DaemonSet already exists")
-	}
-
-	ds.Name = req.Name
-	ds.Namespace = req.Namespace
-	r.ensureDaemonSet(&ds, &c)
-
-	if dsExists {
-		log.V(1).Info("Patched DaemonSet for SyncthingCluster", "name", req.Name)
-		err = r.Patch(ctx, &ds, dsPatch)
-	} else {
-		log.V(1).Info("Created DaemonSet for SyncthingCluster", "name", req.Name)
-		if err := ctrl.SetControllerReference(&c, &ds, r.Scheme); err != nil {
-			return ctrl.Result{}, err
-		}
-		err = r.Create(ctx, &ds)
-	}
-
-	log.V(1).Info("DaemonSet reconciled", "generation", ds.Generation)
-
-	dss := ds.Status
-	if dss.ObservedGeneration < ds.Generation || dss.NumberReady < dss.DesiredNumberScheduled || dss.UpdatedNumberScheduled < dss.DesiredNumberScheduled {
-		log.V(1).Info("DaemonSet not yet up to date")
-		return ctrl.Result{}, r.updateReadiness(ctx, &c, false, "DaemonSetNotUpToDate", "DaemonSet has not fully rolled out yet")
 	}
 
 	if !hasFinalizer {
@@ -121,17 +90,21 @@ func (r *SyncthingClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		}
 	}
 
-	// Enumerate the created Syncthing pods, ping the REST status API of each.
+	if !dsReady {
+		// DaemonSet isn't ready, reconciliation cannot proceed to Syncthing configuration phase.
+		return reconcile.Result{}, nil
+	}
+
+	// Enumerate the Syncthing pods, ping the REST status API of each.
 	var pods corev1.PodList
-	err = r.List(ctx, &pods, client.InNamespace(req.Namespace), client.MatchingFields{"daemonset-owner": ds.Name})
+	err = r.List(ctx, &pods, client.InNamespace(req.Namespace), client.MatchingFields{"daemonset-owner": req.Name})
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	cli := &http.Client{
-		Transport: &SyncthingRestTransport{RoundTripper: http.DefaultTransport},
-	}
-	c.Status.Nodes = make(map[string]stcsamcdaycomv1alpha1.SyncthingClusterStatusNode)
+	isReady := true
+
+	c.Status.Nodes = make(map[string]stc.SyncthingClusterStatusNode)
 	for _, pod := range pods.Items {
 		var versionResp struct {
 			Version string `json:"version,omitempty"`
@@ -140,52 +113,74 @@ func (r *SyncthingClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			ID string `json:"myID,omitempty"`
 		}
 
-		resp, err := cli.Get(fmt.Sprintf("http://%s:8384/rest/system/version", pod.Status.PodIP))
+		failed := false
+		err = r.stAPI(pod.Status.PodIP, "system/version", &versionResp)
 		if err != nil {
-			return ctrl.Result{}, err
-		}
-		err = json.NewDecoder(resp.Body).Decode(&versionResp)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		resp, err = cli.Get(fmt.Sprintf("http://%s:8384/rest/system/status", pod.Status.PodIP))
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		err = json.NewDecoder(resp.Body).Decode(&statusResp)
-		if err != nil {
-			return ctrl.Result{}, err
+			failed = true
 		}
 
-		c.Status.Nodes[pod.Spec.NodeName] = stcsamcdaycomv1alpha1.SyncthingClusterStatusNode{
-			DeviceID: statusResp.ID,
-			Version:  versionResp.Version,
+		err = r.stAPI(pod.Status.PodIP, "system/status", &statusResp)
+		if err != nil {
+			failed = true
+		}
+
+		if failed {
+			isReady = false
+		}
+
+		c.Status.Nodes[pod.Spec.NodeName] = stc.SyncthingClusterStatusNode{
+			Connected: !failed,
+			DeviceID:  statusResp.ID,
+			Version:   versionResp.Version,
 		}
 	}
-
-	err = r.Status().Update(ctx, &c)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// All ready pods have been successfully pinged via REST API.
-	//isReady := false
 
 	if isDeleted {
 		// Check that Syncthing cluster is empty before removing the finalizer.
-		return ctrl.Result{}, fmt.Errorf("not implemented yet")
+		// TODO: implement
+		return ctrl.Result{}, r.updateReadiness(ctx, &c, false, "Deleting", "Cluster is being deleted (TODO, manually remove the finalizer for now)")
 	}
 
-	return ctrl.Result{}, r.updateReadiness(ctx, &c, true, "InSync", "TODO")
+	if dsReady && isReady {
+		return ctrl.Result{RequeueAfter: time.Minute}, r.updateReadiness(ctx, &c, true, "Reconciled", "Cluster is online and configured.")
+	} else if dsReady && !isReady {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, r.updateReadiness(ctx, &c, true, "Waiting", "Waiting for all cluster peers to become ready...")
+	}
+	return ctrl.Result{}, nil
 }
 
-func (r *SyncthingClusterReconciler) ensureDaemonSet(ds *appsv1.DaemonSet, c *stcsamcdaycomv1alpha1.SyncthingCluster) {
+func (r *SyncthingClusterReconciler) stAPI(ip, path string, out interface{}) error {
+	resp, err := r.stClient.Get(fmt.Sprintf("http://%s:8384/rest/%s", ip, path))
+	if err != nil {
+		return err
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+func (r *SyncthingClusterReconciler) ensureDaemonSet(ctx context.Context, req reconcile.Request, c *stc.SyncthingCluster) (bool, error) {
+	var ds appsv1.DaemonSet
+	err := r.Client.Get(ctx, req.NamespacedName, &ds)
+	if err != nil && !errors.IsNotFound(err) {
+		return false, err
+	}
+
+	dsPatch := client.MergeFrom(ds.DeepCopy())
+	dsExists := ds.Name != ""
+
+	owner := metav1.GetControllerOf(&ds)
+	if dsExists && (owner == nil || owner.APIVersion != stc.GroupVersion.String() || owner.Kind != c.Kind) {
+		return false, r.updateReadiness(ctx, c, false,
+			"Error", fmt.Sprintf("An unmanaged DaemonSet with the name '%s' already exists", req.Name))
+	}
+
+	// Ensure baseline DaemonSet metadata (name, namespace, label selector, pod template from config)
+	ds.Name = req.Name
+	ds.Namespace = req.Namespace
 	appLabels := map[string]string{
 		"app.kubernetes.io/name":      "stc",
 		"app.kubernetes.io/instance":  ds.Name,
 		"app.kubernetes.io/component": "syncthing",
 	}
-
 	ds.Spec.Selector = &metav1.LabelSelector{
 		MatchLabels: appLabels,
 	}
@@ -195,11 +190,11 @@ func (r *SyncthingClusterReconciler) ensureDaemonSet(ds *appsv1.DaemonSet, c *st
 	podSpec := &dsTmpl.Spec
 	podSpec.RestartPolicy = corev1.RestartPolicyAlways
 
+	// Ensure node affinity includes supported Syncthing platforms (amd64, arm64, arm)
 	if podSpec.Affinity == nil {
 		podSpec.Affinity = &corev1.Affinity{}
 	}
 	aff := podSpec.Affinity
-
 	if aff.NodeAffinity == nil {
 		aff.NodeAffinity = &corev1.NodeAffinity{}
 	}
@@ -207,8 +202,6 @@ func (r *SyncthingClusterReconciler) ensureDaemonSet(ds *appsv1.DaemonSet, c *st
 	if nodeAff.RequiredDuringSchedulingIgnoredDuringExecution == nil {
 		nodeAff.RequiredDuringSchedulingIgnoredDuringExecution = &corev1.NodeSelector{}
 	}
-
-	// Ensure node affinity includes support Syncthing platforms (amd64, arm64, arm)
 	rdside := nodeAff.RequiredDuringSchedulingIgnoredDuringExecution
 	rdside.NodeSelectorTerms = append(rdside.NodeSelectorTerms, corev1.NodeSelectorTerm{
 		MatchExpressions: []corev1.NodeSelectorRequirement{
@@ -284,9 +277,25 @@ func (r *SyncthingClusterReconciler) ensureDaemonSet(ds *appsv1.DaemonSet, c *st
 		mnt = &ctr.VolumeMounts[len(ctr.VolumeMounts)-1]
 	}
 	mnt.Name = "syncthing-data"
+
+	if dsExists {
+		err = r.Patch(ctx, &ds, dsPatch)
+	} else {
+		if err := ctrl.SetControllerReference(c, &ds, r.Scheme); err != nil {
+			return false, err
+		}
+		err = r.Create(ctx, &ds)
+	}
+
+	dss := ds.Status
+	if dss.ObservedGeneration < ds.Generation || dss.NumberReady < dss.DesiredNumberScheduled || dss.UpdatedNumberScheduled < dss.DesiredNumberScheduled {
+		return false, r.updateReadiness(ctx, c, false, "DaemonSetNotUpToDate", "DaemonSet has not fully rolled out yet")
+	}
+
+	return true, nil
 }
 
-func (r *SyncthingClusterReconciler) updateReadiness(ctx context.Context, c *stcsamcdaycomv1alpha1.SyncthingCluster, isReady bool, reason, message string) error {
+func (r *SyncthingClusterReconciler) updateReadiness(ctx context.Context, c *stc.SyncthingCluster, isReady bool, reason, message string) error {
 	readyStatus := metav1.ConditionFalse
 	if isReady {
 		readyStatus = metav1.ConditionTrue
@@ -302,6 +311,12 @@ func (r *SyncthingClusterReconciler) updateReadiness(ctx context.Context, c *stc
 }
 
 func (r *SyncthingClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.stClient == nil {
+		r.stClient = &http.Client{
+			Transport: &SyncthingRestTransport{RoundTripper: http.DefaultTransport},
+		}
+	}
+
 	err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Pod{}, "daemonset-owner", func(o client.Object) []string {
 		pod := o.(*corev1.Pod)
 		owner := metav1.GetControllerOf(pod)
@@ -315,7 +330,7 @@ func (r *SyncthingClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&stcsamcdaycomv1alpha1.SyncthingCluster{}).
+		For(&stc.SyncthingCluster{}).
 		Owns(&appsv1.DaemonSet{}).
 		Complete(r)
 }

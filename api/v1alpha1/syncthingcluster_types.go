@@ -26,8 +26,9 @@ type SyncthingClusterSpec struct {
 }
 
 type SyncthingClusterStatusNode struct {
-	DeviceID string `json:"deviceID,omitempty"`
-	Version  string `json:"version,omitempty"`
+	Connected bool   `json:"connected"`
+	DeviceID  string `json:"deviceID,omitempty"`
+	Version   string `json:"version,omitempty"`
 }
 
 type SyncthingClusterStatus struct {

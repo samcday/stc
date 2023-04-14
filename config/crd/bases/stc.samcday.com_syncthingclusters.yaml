@@ -6999,10 +6999,14 @@ spec:
               nodes:
                 additionalProperties:
                   properties:
+                    connected:
+                      type: boolean
                     deviceID:
                       type: string
                     version:
                       type: string
+                  required:
+                  - connected
                   type: object
                 type: object
             type: object
