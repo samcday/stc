@@ -46,16 +46,16 @@ import (
 
 type SyncthingClusterReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	stClient *http.Client
+	Scheme *runtime.Scheme
 }
 
-type SyncthingRestTransport struct {
+type SyncthingTransport struct {
 	http.RoundTripper
+	APIKey string
 }
 
-func (srt *SyncthingRestTransport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
-	req.Header.Set("X-API-Key", "boobies")
+func (srt *SyncthingTransport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
+	req.Header.Set("X-API-Key", srt.APIKey)
 	return srt.RoundTripper.RoundTrip(req)
 }
 
@@ -114,11 +114,14 @@ func (r *SyncthingClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	isReady := true
 
 	nodesByIP := make(map[string]*stc.SyncthingClusterStatusNode)
+	clients := make(map[string]*http.Client)
 
 	c.Status.Nodes = make(map[string]*stc.SyncthingClusterStatusNode)
 	for _, pod := range pods.Items {
 		ip := pod.Status.PodIP
-		nodeStatus, err := r.syncthingStatus(ip)
+		client := &http.Client{Transport: &SyncthingTransport{APIKey: string(pod.UID), RoundTripper: http.DefaultTransport}}
+		clients[ip] = client
+		nodeStatus, err := r.syncthingStatus(client, ip)
 		nodesByIP[ip] = nodeStatus
 		c.Status.Nodes[pod.Spec.NodeName] = nodeStatus
 		if err != nil {
@@ -132,7 +135,7 @@ func (r *SyncthingClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	if isReady {
 		// All Syncthing instances are running and appear healthy. Ensure they are configured according to spec.
 		for ip, nodeStatus := range nodesByIP {
-			err := r.ensureSyncthingConfig(log, ip, nodeStatus.DeviceID, &c)
+			err := r.ensureSyncthingConfig(log, clients[ip], ip, nodeStatus.DeviceID, &c)
 			if err != nil {
 				isReady = false
 				nodeStatus.LastErrorTime = metav1.NewTime(time.Now())
@@ -165,8 +168,8 @@ func (r *SyncthingClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	return result, nil
 }
 
-func (r *SyncthingClusterReconciler) stAPI(ip, path string, out interface{}) (resp *http.Response, err error) {
-	resp, err = r.stClient.Get(fmt.Sprintf("http://%s:8384/rest/%s", ip, path))
+func stAPI(stClient *http.Client, ip, path string, out interface{}) (resp *http.Response, err error) {
+	resp, err = stClient.Get(fmt.Sprintf("http://%s:8384/rest/%s", ip, path))
 	if err != nil {
 		return
 	}
@@ -297,6 +300,19 @@ func (r *SyncthingClusterReconciler) ensureDaemonSet(log logr.Logger, ctx contex
 	}
 	mnt.Name = "syncthing-data"
 
+	// Ensure syncthing container has STGUIAPIKEY set.
+	for i, e := range ctr.Env {
+		if e.Name == "STGUIAPIKEY" {
+			ctr.Env[i] = ctr.Env[len(ctr.Env)-1]
+			ctr.Env = ctr.Env[:len(ctr.Env)-1]
+			break
+		}
+	}
+	ctr.Env = append(ctr.Env, corev1.EnvVar{
+		Name:      "STGUIAPIKEY",
+		ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}},
+	})
+
 	if dsExists {
 		err = r.Patch(ctx, &ds, dsPatch)
 	} else {
@@ -330,7 +346,7 @@ func (r *SyncthingClusterReconciler) updateReadiness(log logr.Logger, ctx contex
 	return r.Status().Update(ctx, c)
 }
 
-func (r *SyncthingClusterReconciler) syncthingStatus(ip string) (nodeStatus *stc.SyncthingClusterStatusNode, err error) {
+func (r *SyncthingClusterReconciler) syncthingStatus(client *http.Client, ip string) (nodeStatus *stc.SyncthingClusterStatusNode, err error) {
 	var versionResp struct {
 		Version string `json:"version,omitempty"`
 	}
@@ -349,20 +365,20 @@ func (r *SyncthingClusterReconciler) syncthingStatus(ip string) (nodeStatus *stc
 		Folders: map[string]metav1.Time{},
 	}
 
-	_, err = r.stAPI(ip, "system/version", &versionResp)
+	_, err = stAPI(client, ip, "system/version", &versionResp)
 	if err != nil {
 		return
 	}
 	nodeStatus.Online = true
 	nodeStatus.Version = versionResp.Version
 
-	_, err = r.stAPI(ip, "system/status", &statusResp)
+	_, err = stAPI(client, ip, "system/status", &statusResp)
 	if err != nil {
 		return
 	}
 	nodeStatus.DeviceID = statusResp.ID
 
-	_, err = r.stAPI(ip, "stats/device", &deviceResp)
+	_, err = stAPI(client, ip, "stats/device", &deviceResp)
 	if err != nil {
 		return
 	}
@@ -373,7 +389,7 @@ func (r *SyncthingClusterReconciler) syncthingStatus(ip string) (nodeStatus *stc
 		nodeStatus.Devices[k] = v.LastSeen
 	}
 
-	_, err = r.stAPI(ip, "stats/folder", &folderResp)
+	_, err = stAPI(client, ip, "stats/folder", &folderResp)
 	if err != nil {
 		return
 	}
@@ -384,10 +400,10 @@ func (r *SyncthingClusterReconciler) syncthingStatus(ip string) (nodeStatus *stc
 	return
 }
 
-func (r *SyncthingClusterReconciler) ensureSyncthingConfig(log logr.Logger, ip, myID string, c *stc.SyncthingCluster) error {
+func (r *SyncthingClusterReconciler) ensureSyncthingConfig(log logr.Logger, stClient *http.Client, ip, myID string, c *stc.SyncthingCluster) error {
 	var updateDevices []stconfig.DeviceConfiguration
 
-	resp, err := r.stClient.Get(fmt.Sprintf("http://%s:8384/rest/config", ip))
+	resp, err := stClient.Get(fmt.Sprintf("http://%s:8384/rest/config", ip))
 	if err != nil {
 		panic(err)
 	}
@@ -427,7 +443,7 @@ func (r *SyncthingClusterReconciler) ensureSyncthingConfig(log logr.Logger, ip, 
 			return err
 		}
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := r.stClient.Do(req)
+		resp, err := stClient.Do(req)
 		if err != nil {
 			return err
 		}
@@ -439,12 +455,6 @@ func (r *SyncthingClusterReconciler) ensureSyncthingConfig(log logr.Logger, ip, 
 }
 
 func (r *SyncthingClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	if r.stClient == nil {
-		r.stClient = &http.Client{
-			Transport: &SyncthingRestTransport{RoundTripper: http.DefaultTransport},
-		}
-	}
-
 	err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Pod{}, "daemonset-owner", func(o client.Object) []string {
 		pod := o.(*corev1.Pod)
 		owner := metav1.GetControllerOf(pod)
