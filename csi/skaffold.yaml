@@ -1,0 +1,15 @@
+apiVersion: skaffold/v4beta4
+kind: Config
+metadata:
+  name: csi
+build:
+  artifacts:
+    - image: stc-csi
+      docker:
+        dockerfile: Dockerfile
+  local:
+    useDockerCLI: true
+    useBuildkit: true
+manifests:
+  rawYaml:
+    - k8s/test.yaml
