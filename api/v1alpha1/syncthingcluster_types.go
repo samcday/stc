@@ -21,8 +21,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+type SyncthingClusterSpecDevice struct {
+	Introducer        bool `json:"introducer,omitempty"`
+	AutoAcceptFolders bool `json:"autoAcceptFolders,omitempty"`
+}
+
 type SyncthingClusterSpec struct {
-	PodSpec corev1.PodSpec `json:"podSpec,omitempty"`
+	PodSpec corev1.PodSpec                        `json:"podSpec,omitempty"`
+	Devices map[string]SyncthingClusterSpecDevice `json:"devices,omitempty"`
 }
 
 type SyncthingClusterStatusNode struct {

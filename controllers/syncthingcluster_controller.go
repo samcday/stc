@@ -24,6 +24,8 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
 	stc "github.com/samcday/stc/api/v1alpha1"
+	stconfig "github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/protocol"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
@@ -130,7 +132,7 @@ func (r *SyncthingClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	if isReady {
 		// All Syncthing instances are running and appear healthy. Ensure they are configured according to spec.
 		for ip, nodeStatus := range nodesByIP {
-			err := r.ensureSyncthingConfig(log, ip, &c)
+			err := r.ensureSyncthingConfig(log, ip, nodeStatus.DeviceID, &c)
 			if err != nil {
 				isReady = false
 				nodeStatus.LastErrorTime = metav1.NewTime(time.Now())
@@ -382,25 +384,35 @@ func (r *SyncthingClusterReconciler) syncthingStatus(ip string) (nodeStatus *stc
 	return
 }
 
-type stDeviceConfig struct {
-	DeviceID string `json:"deviceID"`
-	Name     string `json:"name"`
-}
+func (r *SyncthingClusterReconciler) ensureSyncthingConfig(log logr.Logger, ip, myID string, c *stc.SyncthingCluster) error {
+	var updateDevices []stconfig.DeviceConfiguration
 
-func (r *SyncthingClusterReconciler) ensureSyncthingConfig(log logr.Logger, ip string, c *stc.SyncthingCluster) error {
-	var updateDevices []stDeviceConfig
+	resp, err := r.stClient.Get(fmt.Sprintf("http://%s:8384/rest/config", ip))
+	if err != nil {
+		panic(err)
+	}
+	cfg, err := stconfig.ReadJSON(resp.Body, mustDID(myID))
+	if err != nil {
+		panic(err)
+	}
 
 	for nodeName, nodeStatus := range c.Status.Nodes {
-		var cfg stDeviceConfig
-		_, err := r.stAPI(ip, "config/devices/"+nodeStatus.DeviceID, &cfg)
-		if err != nil {
-			return fmt.Errorf("config/devices lookup failed: %v", err)
+		dev, _, found := cfg.Device(mustDID(nodeStatus.DeviceID))
+		if !found || dev.Name != nodeName {
+			dev.Name = nodeName
+			dev.DeviceID = mustDID(nodeStatus.DeviceID)
+			updateDevices = append(updateDevices, dev)
 		}
+	}
 
-		if cfg.DeviceID != nodeStatus.DeviceID || cfg.Name != nodeName {
-			cfg.Name = nodeName
-			cfg.DeviceID = nodeStatus.DeviceID
-			updateDevices = append(updateDevices, cfg)
+	for deviceID, req := range c.Spec.Devices {
+		deviceID := mustDID(deviceID)
+		dev, _, found := cfg.Device(deviceID)
+		if !found || dev.AutoAcceptFolders != req.AutoAcceptFolders || dev.Introducer != req.Introducer {
+			dev.DeviceID = deviceID
+			dev.Introducer = req.Introducer
+			dev.AutoAcceptFolders = req.AutoAcceptFolders
+			updateDevices = append(updateDevices, dev)
 		}
 	}
 
@@ -449,4 +461,12 @@ func (r *SyncthingClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&stc.SyncthingCluster{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&appsv1.DaemonSet{}).
 		Complete(r)
+}
+
+func mustDID(raw string) protocol.DeviceID {
+	did, err := protocol.DeviceIDFromString(raw)
+	if err != nil {
+		panic(err)
+	}
+	return did
 }

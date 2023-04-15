@@ -33,6 +33,15 @@ spec:
             type: object
           spec:
             properties:
+              devices:
+                additionalProperties:
+                  properties:
+                    autoAcceptFolders:
+                      type: boolean
+                    introducer:
+                      type: boolean
+                  type: object
+                type: object
               podSpec:
                 description: PodSpec is a description of a pod.
                 properties:
