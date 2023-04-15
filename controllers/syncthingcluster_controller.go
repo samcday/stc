@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"net/http"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -65,6 +66,7 @@ const finalizerName = "stc.samcday.com/finalizer"
 //+kubebuilder:rbac:groups=stc.samcday.com,resources=syncthingclusters/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=stc.samcday.com,resources=syncthingclusters/finalizers,verbs=update
 
+//+kubebuilder:rbac:groups=,resources=nodes,verbs=get;list;watch;update;patch
 //+kubebuilder:rbac:groups=apps,resources=daemonsets,verbs=get;list;watch;create;update;patch;delete
 
 func (r *SyncthingClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -129,6 +131,46 @@ func (r *SyncthingClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			nodeStatus.LastErrorTime = metav1.NewTime(time.Now())
 			nodeStatus.LastError = err.Error()
 			continue
+		}
+	}
+
+	label := "cluster.stc.samcday.com/" + string(c.UID)
+
+	// Ensure all Nodes running Syncthing instances for this cluster are labelled.
+	for _, pod := range pods.Items {
+		var node corev1.Node
+		err := r.Get(ctx, types.NamespacedName{Name: pod.Spec.NodeName}, &node)
+		if err != nil {
+			return ctrl.Result{}, errors.Wrap(err, "failed to lookup Node "+pod.Spec.NodeName)
+		}
+		if _, ok := node.Labels[label]; !ok {
+			node.Labels[label] = ""
+			err := r.Update(ctx, &node)
+			if err != nil {
+				return ctrl.Result{}, errors.Wrap(err, "failed to update Node")
+			}
+		}
+	}
+	// Ensure label is not on any Nodes where it shouldn't be.
+	var nodes corev1.NodeList
+	err = r.List(ctx, &nodes, client.MatchingFields{"cluster": string(c.UID)})
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "failed to list Nodes")
+	}
+	for _, n := range nodes.Items {
+		remove := true
+		for k := range c.Status.Nodes {
+			if n.Name == k {
+				remove = false
+				break
+			}
+		}
+		if remove {
+			delete(n.Labels, label)
+			err := r.Update(ctx, &n)
+			if err != nil {
+				return ctrl.Result{}, errors.Wrap(err, "failed to update Node")
+			}
 		}
 	}
 
@@ -462,6 +504,20 @@ func (r *SyncthingClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			return nil
 		}
 		return []string{owner.Name}
+	})
+	if err != nil {
+		return err
+	}
+
+	err = mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Node{}, "cluster", func(o client.Object) []string {
+		node := o.(*corev1.Node)
+		var ids []string
+		for k := range node.Labels {
+			if strings.HasPrefix(k, "cluster.stc.samcday.com/") {
+				ids = append(ids, strings.TrimPrefix(k, "cluster.stc.samcday.com/"))
+			}
+		}
+		return ids
 	})
 	if err != nil {
 		return err
