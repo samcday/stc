@@ -66,7 +66,8 @@ const finalizerName = "stc.samcday.com/finalizer"
 //+kubebuilder:rbac:groups=stc.samcday.com,resources=syncthingclusters/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=stc.samcday.com,resources=syncthingclusters/finalizers,verbs=update
 
-//+kubebuilder:rbac:groups=,resources=nodes,verbs=get;list;watch;update;patch
+//+kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;update;patch
+//+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 //+kubebuilder:rbac:groups=apps,resources=daemonsets,verbs=get;list;watch;create;update;patch;delete
 
 func (r *SyncthingClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

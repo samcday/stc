@@ -1,0 +1,23 @@
+apiVersion: skaffold/v4beta4
+kind: Config
+metadata:
+  name: stc
+build:
+  artifacts:
+    - image: samcday/stc
+      docker:
+        dockerfile: Dockerfile
+      hooks:
+        before:
+          - command: [./build.sh]
+      runtimeType: go
+manifests:
+  helm:
+    releases:
+      - name: stc
+        chartPath: chart
+        setValueTemplates:
+          containerSpec:
+            image: "{{.IMAGE_REPO_samcday_stc}}:{{.IMAGE_TAG_samcday_stc}}@{{.IMAGE_DIGEST_samcday_stc}}"
+#  rawYaml:
+#    - config/samples/_v1alpha1_syncthingcluster.yaml

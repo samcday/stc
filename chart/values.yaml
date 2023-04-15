@@ -1,0 +1,47 @@
+config:
+  health:
+    healthProbeBindAddress: :8081
+  metrics:
+    bindAddress: 127.0.0.1:8080
+  webhook:
+    port: 9443
+  leaderElection:
+    leaderElect: true
+    resourceName: stc.samcday.com
+    leaderElectionReleaseOnCancel: true
+containerSpec:
+  name: "{{ .Chart.Name }}"
+  image: samcday/stc
+  imagePullPolicy: IfNotPresent
+  command:
+    - /bin/stc
+    - -config=/config/config.yaml
+  livenessProbe:
+    httpGet:
+      path: /healthz
+      port: 8081
+    initialDelaySeconds: 15
+    periodSeconds: 20
+  readinessProbe:
+    httpGet:
+      path: /readyz
+      port: 8081
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - "ALL"
+  volumeMounts:
+    - name: config
+      mountPath: /config
+imagePullSecrets: []
+nameOverride: ""
+podAnnotations: {}
+podSecurityContext: {}
+fullnameOverride: ""
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
