@@ -70,6 +70,13 @@ metadata:
   namespace: '{{$.Release.Namespace}}'
 rules:
 - apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
   - coordination.k8s.io
   resources:
   - leases

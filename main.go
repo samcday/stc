@@ -49,6 +49,7 @@ func init() {
 }
 
 //+kubebuilder:rbac:namespace="{{$.Release.Namespace}}",groups="coordination.k8s.io",resources=leases,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:namespace="{{$.Release.Namespace}}",groups="",resources=events,verbs=create;patch
 
 func main() {
 	var configFile string
