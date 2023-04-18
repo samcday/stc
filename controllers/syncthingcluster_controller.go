@@ -379,9 +379,22 @@ func (r *SyncthingClusterReconciler) ensureDaemonSet(log logr.Logger, ctx contex
 		ctr.Image = "syncthing/syncthing:1"
 	}
 
-	if len(ctr.Command) == 0 {
-		ctr.Command = []string{"/bin/syncthing"}
+	if ctr.SecurityContext == nil {
+		ctr.SecurityContext = &corev1.SecurityContext{}
 	}
+	if ctr.SecurityContext.Capabilities == nil {
+		ctr.SecurityContext.Capabilities = &corev1.Capabilities{}
+	}
+	ensureCap := func(caps *corev1.Capabilities, name string) {
+		for _, cap := range caps.Add {
+			if string(cap) == name {
+				return
+			}
+		}
+		caps.Add = append(caps.Add, corev1.Capability(name))
+	}
+	ensureCap(ctr.SecurityContext.Capabilities, "CHOWN")
+	ensureCap(ctr.SecurityContext.Capabilities, "FOWNER")
 
 	// Ensure syncthing container has a /var/syncthing volume mount referencing syncthing-data volume.
 	ensureContainerVolumeMount(ctr, "syncthing-data", "/var/syncthing")

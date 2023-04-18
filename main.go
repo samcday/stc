@@ -112,13 +112,21 @@ func (d Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolum
 	for _, dev := range cfg.Devices {
 		folder.Devices = append(folder.Devices, stconfig.FolderDeviceConfiguration{DeviceID: dev.DeviceID})
 	}
+
+	// Folder should send and receive ownership and extra metadata
 	folder.SyncOwnership = true
 	folder.SyncOwnership = true
 	folder.SendXattrs = true
 	folder.SyncXattrs = true
+
+	// Watch the filesystem for changes, react within 1 second. Do a full folder scan every 10 minutes.
+	// These aggressive defaults will likely result in requests to make this configurable before long.
 	folder.FSWatcherEnabled = true
 	folder.FSWatcherDelayS = 1
 	folder.RescanIntervalS = 600
+
+	// With LIFO sync order I can imagine building some simple sync primitives on top of these semantics.
+	// Seems it'd be more friendly to an eventually-consistent shared filesystem view, if RWX were to be supported.
 	folder.Order = stconfig.PullOrderOldestFirst
 
 	body, err := json.Marshal(folder)
