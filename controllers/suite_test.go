@@ -30,7 +30,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	stcsamcdaycomv1alpha1 "github.com/samcday/stc/api/v1alpha1"
+	stcsamcdaycomv1alpha1 "code.samcday.com/me/stc/api/v1alpha1"
 	//+kubebuilder:scaffold:imports
 )
 

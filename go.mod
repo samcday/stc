@@ -1,11 +1,10 @@
-module github.com/samcday/stc
+module code.samcday.com/me/stc
 
 go 1.19
 
 require (
 	github.com/container-storage-interface/spec v1.8.0
 	github.com/go-logr/logr v1.2.3
-	github.com/golang/glog v0.0.0-20160126235308-23def4e6c14b
 	github.com/golang/protobuf v1.5.3
 	github.com/onsi/ginkgo/v2 v2.9.0
 	github.com/onsi/gomega v1.27.1

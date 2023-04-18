@@ -39,8 +39,8 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
-	stcsamcdaycomv1alpha1 "github.com/samcday/stc/api/v1alpha1"
-	"github.com/samcday/stc/controllers"
+	stcsamcdaycomv1alpha1 "code.samcday.com/me/stc/api/v1alpha1"
+	"code.samcday.com/me/stc/controllers"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -103,31 +103,7 @@ func (d Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolum
 		return nil, errors.Wrap(err, "failed to decode JSON")
 	}
 
-	folder, _, _ := cfg.Folder(req.VolumeId)
-
-	folder.ID = req.VolumeId
-	folder.Path = "~/" + req.VolumeId
-
-	// Folder should be offered to all other devices.
-	for _, dev := range cfg.Devices {
-		folder.Devices = append(folder.Devices, stconfig.FolderDeviceConfiguration{DeviceID: dev.DeviceID})
-	}
-
-	// Folder should send and receive ownership and extra metadata
-	folder.SyncOwnership = true
-	folder.SyncOwnership = true
-	folder.SendXattrs = true
-	folder.SyncXattrs = true
-
-	// Watch the filesystem for changes, react within 1 second. Do a full folder scan every 10 minutes.
-	// These aggressive defaults will likely result in requests to make this configurable before long.
-	folder.FSWatcherEnabled = true
-	folder.FSWatcherDelayS = 1
-	folder.RescanIntervalS = 600
-
-	// With LIFO sync order I can imagine building some simple sync primitives on top of these semantics.
-	// Seems it'd be more friendly to an eventually-consistent shared filesystem view, if RWX were to be supported.
-	folder.Order = stconfig.PullOrderOldestFirst
+	folder := configureFolder(&cfg, req.VolumeId)
 
 	body, err := json.Marshal(folder)
 	if err != nil {
@@ -160,6 +136,35 @@ func (d Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolum
 	// Done.
 
 	return &csi.NodePublishVolumeResponse{}, nil
+}
+
+func configureFolder(cfg *stconfig.Configuration, name string) *stconfig.FolderConfiguration {
+	folder, _, _ := cfg.Folder(name)
+
+	// Folder should be offered to all other devices.
+	for _, dev := range cfg.Devices {
+		folder.Devices = append(folder.Devices, stconfig.FolderDeviceConfiguration{DeviceID: dev.DeviceID})
+	}
+
+	folder.ID = name
+	folder.Path = "~/" + name
+
+	// Folder should send and receive ownership and extra metadata
+	folder.SyncOwnership = true
+	folder.SendOwnership = true
+	folder.SendXattrs = true
+	folder.SyncXattrs = true
+
+	// Watch the filesystem for changes, react within 1 second. Do a full folder scan every 10 minutes.
+	// These aggressive defaults will likely result in requests to make this configurable before long.
+	folder.FSWatcherEnabled = true
+	folder.FSWatcherDelayS = 1
+	folder.RescanIntervalS = 600
+
+	// With LIFO sync order I can imagine building some simple sync primitives on top of these semantics.
+	// Seems it'd be more friendly to an eventually-consistent shared filesystem view, if RWX were to be supported.
+	folder.Order = stconfig.PullOrderOldestFirst
+	return &folder
 }
 
 func (d Driver) NodeUnpublishVolume(ctx context.Context, request *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {

@@ -18,12 +18,12 @@ package controllers
 
 import (
 	"bytes"
+	stc "code.samcday.com/me/stc/api/v1alpha1"
 	"context"
 	"encoding/json"
 	"fmt"
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
-	stc "github.com/samcday/stc/api/v1alpha1"
 	stconfig "github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/protocol"
 	appsv1 "k8s.io/api/apps/v1"
@@ -386,8 +386,8 @@ func (r *SyncthingClusterReconciler) ensureDaemonSet(log logr.Logger, ctx contex
 		ctr.SecurityContext.Capabilities = &corev1.Capabilities{}
 	}
 	ensureCap := func(caps *corev1.Capabilities, name string) {
-		for _, cap := range caps.Add {
-			if string(cap) == name {
+		for _, c := range caps.Add {
+			if string(c) == name {
 				return
 			}
 		}
@@ -401,6 +401,7 @@ func (r *SyncthingClusterReconciler) ensureDaemonSet(log logr.Logger, ctx contex
 
 	// Ensure syncthing container has STGUIAPIKEY set.
 	ensureContainerSTGUIAPIKEY(ctr)
+	ensureContainerEnvValue(ctr, "PCAP", "cap_chown,cap_fowner+ep")
 
 	ensureCSIDriverContainer(c, &ds)
 	ensureNodeRegistrarContainer(c, &ds)
@@ -693,6 +694,26 @@ func (r *SyncthingClusterReconciler) ensureSyncthingConfig(log logr.Logger, stCl
 			dev.Introducer = req.Introducer
 			dev.AutoAcceptFolders = req.AutoAcceptFolders
 			updateDevices = append(updateDevices, dev)
+		}
+	}
+
+	uid := string(c.UID)
+	if cfg.GUI.User != "user" || cfg.GUI.CompareHashedPassword(uid) != nil || cfg.GUI.APIKey != uid {
+		cfg.GUI.User = "user"
+		cfg.GUI.Password = uid
+		cfg.GUI.APIKey = uid
+		body, err := json.Marshal(cfg.GUI)
+		if err != nil {
+			return err
+		}
+		req, err := http.NewRequest("PUT", fmt.Sprintf("http://%s:8384/rest/config/gui", ip), bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := stClient.Do(req)
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode != 200 {
+			return fmt.Errorf("GUI config update HTTP error: %d", resp.StatusCode)
 		}
 	}
 
