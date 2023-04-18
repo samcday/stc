@@ -23,7 +23,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/golang/glog"
+	"github.com/go-logr/logr"
 	"github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/pkg/errors"
 	stconfig "github.com/syncthing/syncthing/lib/config"
@@ -33,20 +33,19 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	stcsamcdaycomv1alpha1 "github.com/samcday/stc/api/v1alpha1"
+	"github.com/samcday/stc/controllers"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-
-	stcsamcdaycomv1alpha1 "github.com/samcday/stc/api/v1alpha1"
-	"github.com/samcday/stc/controllers"
 	//+kubebuilder:scaffold:imports
 )
 
@@ -68,6 +67,7 @@ type Driver struct {
 	Name     string
 	Endpoint string
 	NodeName string
+	Log      logr.Logger
 }
 
 func (d Driver) GetPluginInfo(ctx context.Context, r *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {
@@ -116,9 +116,10 @@ func (d Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolum
 	folder.SyncOwnership = true
 	folder.SendXattrs = true
 	folder.SyncXattrs = true
-	// TODO
-	//folder.Order
+	folder.FSWatcherEnabled = true
 	folder.FSWatcherDelayS = 1
+	folder.RescanIntervalS = 600
+	folder.Order = stconfig.PullOrderOldestFirst
 
 	body, err := json.Marshal(folder)
 	if err != nil {
@@ -133,10 +134,17 @@ func (d Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolum
 		return nil, fmt.Errorf("POST /rest/config/folders/%s HTTP error %s\n%s", req.VolumeId, resp.Status, string(b))
 	}
 
-	cmd := exec.Command("mount", "--bind", "/var/syncthing/"+req.VolumeId, req.TargetPath)
+	err = os.MkdirAll(req.TargetPath, 0755)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to mkdir %s", req.TargetPath)
+	}
+
+	args := []string{"mount", "--bind", "/var/syncthing/" + req.VolumeId, req.TargetPath}
+	cmd := exec.Command("/usr/bin/env", args...)
 	err = cmd.Run()
 	if err != nil {
-		return nil, errors.Wrap(err, "bind mount failed")
+		output, _ := cmd.CombinedOutput()
+		return nil, errors.Wrapf(err, "%s failed: %s", args, output)
 	}
 	// Wait until all known devices are online
 	// Wait until all devices have been seen more recently than publish start time.
@@ -186,6 +194,20 @@ func (d SyncthingTransport) RoundTrip(req *http.Request) (resp *http.Response, e
 //+kubebuilder:rbac:namespace="{{$.Release.Namespace}}",groups="",resources=events,verbs=create;patch
 
 func main() {
+	var configFile string
+	flag.StringVar(&configFile, "config", "",
+		"The controller will load its initial configuration from this file. "+
+			"Omit this flag to use the default configuration values. "+
+			"Command-line flags override configuration from this file.")
+	opts := zap.Options{
+		Development: true,
+	}
+	opts.BindFlags(flag.CommandLine)
+	flag.Parse()
+
+	log := zap.New(zap.UseFlagOptions(&opts))
+	ctrl.SetLogger(log)
+
 	csiSocket := os.Getenv("CSI_SOCKET")
 	if csiSocket != "" {
 		driverName := os.Getenv("DRIVER_NAME")
@@ -204,8 +226,14 @@ func main() {
 		if apiKey == "" {
 			panic("STGUIAPIKEY not set")
 		}
-		server := grpc.NewServer(grpc.UnaryInterceptor(log))
+		server := grpc.NewServer(grpc.UnaryInterceptor(func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+			if info.FullMethod != "/csi.v1.Identity/Probe" {
+				log.V(0).Info("GRPC request", "method", info.FullMethod)
+			}
+			return handler(ctx, req)
+		}))
 		driver := &Driver{
+			Log:          log,
 			Endpoint:     endpoint,
 			RoundTripper: http.DefaultTransport,
 			Client:       &http.Client{Transport: &SyncthingTransport{APIKey: apiKey, Transport: http.DefaultTransport}},
@@ -231,19 +259,6 @@ func main() {
 
 		return
 	}
-
-	var configFile string
-	flag.StringVar(&configFile, "config", "",
-		"The controller will load its initial configuration from this file. "+
-			"Omit this flag to use the default configuration values. "+
-			"Command-line flags override configuration from this file.")
-	opts := zap.Options{
-		Development: true,
-	}
-	opts.BindFlags(flag.CommandLine)
-	flag.Parse()
-
-	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
 	var err error
 	options := ctrl.Options{Scheme: scheme}
@@ -284,11 +299,4 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
-}
-
-func log(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
-	if info.FullMethod != "/csi.v1.Identity/Probe" {
-		glog.V(0).Infof("GRPC: %s", info.FullMethod)
-	}
-	return handler(ctx, req)
 }

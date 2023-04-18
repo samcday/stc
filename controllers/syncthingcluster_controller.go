@@ -505,11 +505,12 @@ func ensureCSIDriverContainer(c *stc.SyncthingCluster, a *appsv1.DaemonSet) {
 	ensureContainerEnvValue(ctr, "DRIVER_NAME", string(c.UID)+".stc.samcday.com")
 	ensureContainerEnvValue(ctr, "CSI_SOCKET", "/run/csi/socket")
 
-	ensureContainerVolumeMount(ctr, "syncthing-data", "/var/syncthing")
+	mp := corev1.MountPropagationBidirectional
+	mnt := ensureContainerVolumeMount(ctr, "syncthing-data", "/var/syncthing")
+	mnt.MountPropagation = &mp
 	ensureContainerVolumeMount(ctr, "csi", "/run/csi")
 	ensureContainerVolumeMount(ctr, "dev", "/dev")
-	mnt := ensureContainerVolumeMount(ctr, "kubelet", "/var/lib/kubelet")
-	mp := corev1.MountPropagationBidirectional
+	mnt = ensureContainerVolumeMount(ctr, "kubelet", "/var/lib/kubelet")
 	mnt.MountPropagation = &mp
 }
 
