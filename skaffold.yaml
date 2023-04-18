@@ -16,8 +16,33 @@ manifests:
     releases:
       - name: stc
         chartPath: chart
+        setValues:
+          config.leaderElection.leaderElect: false
+          containerSpec:
+            livenessProbe.initialDelaySeconds: 1
+            readinessProbe.initialDelaySeconds: 1
         setValueTemplates:
           containerSpec:
             image: "{{.IMAGE_REPO_samcday_stc}}:{{.IMAGE_TAG_samcday_stc}}@{{.IMAGE_DIGEST_samcday_stc}}"
-#  rawYaml:
-#    - config/samples/_v1alpha1_syncthingcluster.yaml
+deploy:
+  helm:
+    hooks:
+      before:
+        - host:
+            command: [ kubectl, apply, -f, chart/crds/stc.samcday.com_syncthingclusters.yaml, --server-side=true ]
+profiles:
+  - name: amd64
+    patches:
+      - op: add
+        path: /manifests/helm/releases/0/setValues/nodeSelector.kubernetes\.io~1arch
+        value: amd64
+      - op: add
+        path: /manifests/helm/releases/0/setValues/defaultCluster.spec.podSpec.nodeSelector.kubernetes\.io~1arch
+        value: amd64
+  - name: cluster
+    patches:
+      - op: add
+        path: /manifests/helm/releases/0/setValues/defaultCluster
+        value:
+          enabled: true
+          metadata.name: default

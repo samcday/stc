@@ -1,0 +1,8 @@
+{{ if $.Values.defaultCluster.enabled }}
+apiVersion: stc.samcday.com/v1alpha1
+kind: SyncthingCluster
+metadata:
+  {{- tpl (toYaml $.Values.defaultCluster.metadata) $ | nindent 2 }}
+spec:
+  {{- tpl (toYaml $.Values.defaultCluster.spec) $ | nindent 2 }}
+{{ end }}

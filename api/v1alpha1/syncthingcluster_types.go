@@ -27,8 +27,9 @@ type SyncthingClusterSpecDevice struct {
 }
 
 type SyncthingClusterSpec struct {
-	PodSpec corev1.PodSpec                        `json:"podSpec,omitempty"`
-	Devices map[string]SyncthingClusterSpecDevice `json:"devices,omitempty"`
+	Devices          map[string]SyncthingClusterSpecDevice `json:"devices,omitempty"`
+	PodSpec          *corev1.PodSpec                       `json:"podSpec,omitempty"`
+	StorageClassName string                                `json:"StorageClassName,omitempty"`
 }
 
 type SyncthingClusterStatusNode struct {

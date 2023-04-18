@@ -28,12 +28,15 @@ import (
 	"github.com/syncthing/syncthing/lib/protocol"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/pointer"
 	"net/http"
+	"os"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -70,6 +73,9 @@ const finalizerName = "stc.samcday.com/finalizer"
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 //+kubebuilder:rbac:groups=apps,resources=daemonsets,verbs=get;list;watch;create;update;patch;delete
 
+//+kubebuilder:rbac:groups=storage.k8s.io,resources=csidrivers,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch;create;update;patch;delete
+
 func (r *SyncthingClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := klog.FromContext(ctx)
 
@@ -87,7 +93,7 @@ func (r *SyncthingClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, nil
 	}
 
-	dsReady, err := r.ensureDaemonSet(log, ctx, req, &c)
+	ds, err := r.ensureDaemonSet(log, ctx, &c)
 	if err != nil {
 		return ctrl.Result{}, errors.Wrapf(err, "failed to reconcile DaemonSet for '%s'", req.Name)
 	}
@@ -102,14 +108,14 @@ func (r *SyncthingClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		}
 	}
 
-	if !dsReady {
+	if ds == nil {
 		// DaemonSet isn't ready, reconciliation cannot proceed to Syncthing configuration phase.
 		return reconcile.Result{}, nil
 	}
 
 	// Enumerate the Syncthing pods, ping the REST status API of each.
 	var pods corev1.PodList
-	err = r.List(ctx, &pods, client.InNamespace(req.Namespace), client.MatchingFields{"daemonset-owner": req.Name})
+	err = r.List(ctx, &pods, client.InNamespace(req.Namespace), client.MatchingFields{"daemonset-owner": ds.Name})
 	if err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "failed to list pods")
 	}
@@ -118,14 +124,16 @@ func (r *SyncthingClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	nodesByIP := make(map[string]*stc.SyncthingClusterStatusNode)
 	clients := make(map[string]*http.Client)
+	clientIPs := make(map[string]string)
 
 	c.Status.Nodes = make(map[string]*stc.SyncthingClusterStatusNode)
 	for _, pod := range pods.Items {
 		ip := pod.Status.PodIP
-		client := &http.Client{Transport: &SyncthingTransport{APIKey: string(pod.UID), RoundTripper: http.DefaultTransport}}
-		clients[ip] = client
-		nodeStatus, err := r.syncthingStatus(client, ip)
+		cli := &http.Client{Transport: &SyncthingTransport{APIKey: string(pod.UID), RoundTripper: http.DefaultTransport}}
+		clients[ip] = cli
+		nodeStatus, err := r.syncthingStatus(cli, ip)
 		nodesByIP[ip] = nodeStatus
+		clientIPs[pod.Spec.NodeName] = ip
 		c.Status.Nodes[pod.Spec.NodeName] = nodeStatus
 		if err != nil {
 			isReady = false
@@ -190,8 +198,64 @@ func (r *SyncthingClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	if isDeleted {
-		// TODO: Check that Syncthing cluster is empty before removing the finalizer.
-		return ctrl.Result{}, r.updateReadiness(log, ctx, &c, false, "Deleting", "Cluster is being deleted (TODO, manually remove the finalizer for now)")
+		if isReady {
+			for name, v := range c.Status.Nodes {
+				ip := clientIPs[name]
+				var completion struct {
+					Completion  float64 `json:"completion"`
+					GlobalBytes int     `json:"globalBytes"`
+					GlobalItems int     `json:"globalItems"`
+				}
+				_, err := stAPI(clients[ip], ip, "/rest/db/completion?device="+string(v.DeviceID), &completion)
+				if err != nil {
+					return ctrl.Result{}, err
+				}
+				if completion.GlobalItems > 0 || completion.GlobalBytes > 0 {
+					return ctrl.Result{}, r.updateReadiness(log, ctx, &c, false,
+						"Deleting", fmt.Sprintf("Node %s (%s) still has %d local files / %d local bytes",
+							name, v.DeviceID, completion.GlobalItems, completion.GlobalBytes))
+				}
+			}
+
+			// Ensure CSIDriver + StorageClass are deleted.
+			var drv storagev1.CSIDriver
+			err := r.Get(ctx, types.NamespacedName{Name: csiDriverName(&c)}, &drv)
+			if err != nil && !k8serr.IsNotFound(err) {
+				return ctrl.Result{}, errors.Wrap(err, "failed to get CSIDriver")
+			}
+			if drv.Name != "" {
+				err := r.Delete(ctx, &drv)
+				if err != nil {
+					return ctrl.Result{}, errors.Wrap(err, "failed to delete CSIDriver")
+				}
+			}
+			var sc storagev1.StorageClass
+			err = r.Get(ctx, types.NamespacedName{Name: storageClassName(&c)}, &sc)
+			if err != nil && !k8serr.IsNotFound(err) {
+				return ctrl.Result{}, errors.Wrap(err, "failed to get StorageClass")
+			}
+			if sc.Name != "" {
+				err := r.Delete(ctx, &sc)
+				if err != nil {
+					return ctrl.Result{}, errors.Wrap(err, "failed to delete StorageClass")
+				}
+			}
+
+			controllerutil.RemoveFinalizer(&c, finalizerName)
+			return ctrl.Result{}, r.Update(ctx, &c)
+		} else {
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, r.updateReadiness(log, ctx, &c, false, "Deleting", "Waiting for cluster to be ready, before deleting it")
+		}
+	}
+
+	err = r.ensureCSIDriver(ctx, log, &c)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "failed to reconcile CSIDriver")
+	}
+
+	err = r.ensureStorageClass(ctx, log, &c)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "failed to reconcile StorageClass")
 	}
 
 	reason := "Waiting"
@@ -222,11 +286,12 @@ func stAPI(stClient *http.Client, ip, path string, out interface{}) (resp *http.
 	return
 }
 
-func (r *SyncthingClusterReconciler) ensureDaemonSet(log logr.Logger, ctx context.Context, req reconcile.Request, c *stc.SyncthingCluster) (bool, error) {
+func (r *SyncthingClusterReconciler) ensureDaemonSet(log logr.Logger, ctx context.Context, c *stc.SyncthingCluster) (*appsv1.DaemonSet, error) {
 	var ds appsv1.DaemonSet
-	err := r.Client.Get(ctx, req.NamespacedName, &ds)
+	dsName := fmt.Sprintf("stc-%s", c.Name)
+	err := r.Client.Get(ctx, types.NamespacedName{Name: dsName, Namespace: c.Namespace}, &ds)
 	if err != nil && !k8serr.IsNotFound(err) {
-		return false, err
+		return nil, err
 	}
 
 	dsPatch := client.MergeFrom(ds.DeepCopy())
@@ -234,24 +299,35 @@ func (r *SyncthingClusterReconciler) ensureDaemonSet(log logr.Logger, ctx contex
 
 	owner := metav1.GetControllerOf(&ds)
 	if dsExists && (owner == nil || owner.APIVersion != stc.GroupVersion.String() || owner.Kind != c.Kind) {
-		return false, r.updateReadiness(log, ctx, c, false,
-			"Error", fmt.Sprintf("An unmanaged DaemonSet with the name '%s' already exists", req.Name))
+		return nil, r.updateReadiness(log, ctx, c, false,
+			"Error", fmt.Sprintf("An unmanaged DaemonSet with the name '%s' already exists", dsName))
 	}
 
 	// Ensure baseline DaemonSet metadata (name, namespace, label selector, pod template from config)
-	ds.Name = req.Name
-	ds.Namespace = req.Namespace
+	ds.Name = dsName
+	ds.Namespace = c.Namespace
+	if ds.Labels == nil {
+		ds.Labels = map[string]string{}
+	}
 	appLabels := map[string]string{
 		"app.kubernetes.io/name":      "stc",
 		"app.kubernetes.io/instance":  ds.Name,
 		"app.kubernetes.io/component": "syncthing",
 	}
 	ds.Spec.Selector = &metav1.LabelSelector{
-		MatchLabels: appLabels,
+		MatchLabels: map[string]string{},
 	}
 	dsTmpl := &ds.Spec.Template
-	dsTmpl.Labels = appLabels
-	dsTmpl.Spec = *c.Spec.PodSpec.DeepCopy()
+	dsTmpl.Labels = map[string]string{}
+	for k, v := range appLabels {
+		dsTmpl.Labels[k] = v
+		ds.Spec.Selector.MatchLabels[k] = v
+	}
+	if c.Spec.PodSpec != nil {
+		dsTmpl.Spec = *c.Spec.PodSpec.DeepCopy()
+	} else {
+		dsTmpl.Spec = corev1.PodSpec{}
+	}
 	podSpec := &dsTmpl.Spec
 	podSpec.RestartPolicy = corev1.RestartPolicyAlways
 
@@ -278,99 +354,230 @@ func (r *SyncthingClusterReconciler) ensureDaemonSet(log logr.Logger, ctx contex
 		},
 	})
 
+	ensurePodHostPathVolume(podSpec, "kubelet", "/var/lib/kubelet", corev1.HostPathDirectory)
+	ensurePodHostPathVolume(podSpec, "csi", "/var/lib/kubelet/plugins/"+string(c.UID)+".stc.samcday.com", corev1.HostPathDirectoryOrCreate)
+	ensurePodHostPathVolume(podSpec, "registration", "/var/lib/kubelet/plugins_registry", corev1.HostPathDirectory)
+	ensurePodHostPathVolume(podSpec, "dev", "/dev", corev1.HostPathDirectory)
+
 	// Ensure pod has a "syncthing-data" volume, which is a hostPath mount.
-	var vol *corev1.Volume
-	for i := range podSpec.Volumes {
-		if podSpec.Volumes[i].Name == "syncthing-data" {
-			vol = &podSpec.Volumes[i]
-			break
-		}
-	}
-	if vol == nil {
-		podSpec.Volumes = append(podSpec.Volumes, corev1.Volume{})
-		vol = &podSpec.Volumes[len(podSpec.Volumes)-1]
-	}
-	hostPath := ""
-	if vol.VolumeSource.HostPath != nil {
+	vol := ensurePodVolume(podSpec, "syncthing-data")
+	hostPath := "/var/syncthing/" + string(c.UID)
+	if vol.VolumeSource.HostPath != nil && vol.VolumeSource.HostPath.Path != "" {
 		hostPath = vol.VolumeSource.HostPath.Path
 	}
-	if hostPath == "" {
-		hostPath = "/var/syncthing/" + string(c.UID)
-	}
 	hostPathType := corev1.HostPathDirectoryOrCreate
-	*vol = corev1.Volume{
-		Name: "syncthing-data",
-		VolumeSource: corev1.VolumeSource{
-			HostPath: &corev1.HostPathVolumeSource{
-				Type: &hostPathType,
-				Path: hostPath,
-			},
+	vol.VolumeSource = corev1.VolumeSource{
+		HostPath: &corev1.HostPathVolumeSource{
+			Type: &hostPathType,
+			Path: hostPath,
 		},
 	}
 
 	// Ensure pod has a "syncthing" container.
-	var ctr *corev1.Container
-	for i := range podSpec.Containers {
-		if podSpec.Containers[i].Name == "syncthing" {
-			ctr = &podSpec.Containers[i]
-			break
-		}
-	}
-	if ctr == nil {
-		podSpec.Containers = append(podSpec.Containers, corev1.Container{
-			Name: "syncthing",
-		})
-		ctr = &podSpec.Containers[len(podSpec.Containers)-1]
-	}
-
+	ctr := ensurePodContainer(podSpec, "syncthing")
 	if ctr.Image == "" {
 		ctr.Image = "syncthing/syncthing:1"
 	}
 
+	if len(ctr.Command) == 0 {
+		ctr.Command = []string{"/bin/syncthing"}
+	}
+
 	// Ensure syncthing container has a /var/syncthing volume mount referencing syncthing-data volume.
-	var mnt *corev1.VolumeMount
-	for i := range ctr.VolumeMounts {
-		if ctr.VolumeMounts[i].MountPath == "/var/syncthing" {
-			mnt = &ctr.VolumeMounts[i]
-			break
-		}
-	}
-	if mnt == nil {
-		ctr.VolumeMounts = append(ctr.VolumeMounts, corev1.VolumeMount{
-			MountPath: "/var/syncthing",
-		})
-		mnt = &ctr.VolumeMounts[len(ctr.VolumeMounts)-1]
-	}
-	mnt.Name = "syncthing-data"
+	ensureContainerVolumeMount(ctr, "syncthing-data", "/var/syncthing")
 
 	// Ensure syncthing container has STGUIAPIKEY set.
-	for i, e := range ctr.Env {
-		if e.Name == "STGUIAPIKEY" {
-			ctr.Env[i] = ctr.Env[len(ctr.Env)-1]
-			ctr.Env = ctr.Env[:len(ctr.Env)-1]
-			break
-		}
-	}
-	ctr.Env = append(ctr.Env, corev1.EnvVar{
-		Name:      "STGUIAPIKEY",
-		ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}},
-	})
+	ensureContainerSTGUIAPIKEY(ctr)
+
+	ensureCSIDriverContainer(c, &ds)
+	ensureNodeRegistrarContainer(c, &ds)
 
 	if dsExists {
 		err = r.Patch(ctx, &ds, dsPatch)
 	} else {
 		if err := ctrl.SetControllerReference(c, &ds, r.Scheme); err != nil {
-			return false, err
+			return nil, err
 		}
 		err = r.Create(ctx, &ds)
+	}
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create/update DaemonSet")
 	}
 
 	dss := ds.Status
 	if dss.ObservedGeneration < ds.Generation || dss.NumberReady < dss.DesiredNumberScheduled || dss.UpdatedNumberScheduled < dss.DesiredNumberScheduled {
-		return false, r.updateReadiness(log, ctx, c, false, "DaemonSetNotUpToDate", "DaemonSet has not fully rolled out yet")
+		return nil, r.updateReadiness(log, ctx, c, false, "DaemonSetNotUpToDate", "DaemonSet has not fully rolled out yet")
 	}
 
-	return true, nil
+	return &ds, nil
+}
+
+func ensurePodHostPathVolume(pod *corev1.PodSpec, name, path string, t corev1.HostPathType) {
+	vol := ensurePodVolume(pod, name)
+	if vol.HostPath == nil {
+		*vol = corev1.Volume{Name: name}
+	}
+	vol.HostPath = &corev1.HostPathVolumeSource{
+		Path: path,
+		Type: &t,
+	}
+}
+
+func ensurePodContainer(pod *corev1.PodSpec, name string) *corev1.Container {
+	for i := range pod.Containers {
+		if pod.Containers[i].Name == name {
+			return &pod.Containers[i]
+		}
+	}
+	pod.Containers = append(pod.Containers, corev1.Container{Name: name})
+	return &pod.Containers[len(pod.Containers)-1]
+}
+
+func ensurePodVolume(pod *corev1.PodSpec, name string) *corev1.Volume {
+	for i := range pod.Volumes {
+		if pod.Volumes[i].Name == name {
+			return &pod.Volumes[i]
+		}
+	}
+	pod.Volumes = append(pod.Volumes, corev1.Volume{Name: name})
+	return &pod.Volumes[len(pod.Volumes)-1]
+}
+
+func removeContainerEnv(ctr *corev1.Container, name string) {
+	for i, e := range ctr.Env {
+		if e.Name == name {
+			ctr.Env[i] = ctr.Env[len(ctr.Env)-1]
+			ctr.Env = ctr.Env[:len(ctr.Env)-1]
+			return
+		}
+	}
+}
+
+func ensureContainerEnvValue(ctr *corev1.Container, name, value string) {
+	removeContainerEnv(ctr, name)
+	ctr.Env = append(ctr.Env, corev1.EnvVar{
+		Name:  name,
+		Value: value,
+	})
+}
+
+func ensureContainerEnvValueFrom(ctr *corev1.Container, name string, env *corev1.EnvVarSource) {
+	removeContainerEnv(ctr, name)
+	ctr.Env = append(ctr.Env, corev1.EnvVar{
+		Name:      name,
+		ValueFrom: env,
+	})
+}
+
+func ensureContainerSTGUIAPIKEY(ctr *corev1.Container) {
+	ensureContainerEnvValueFrom(ctr, "STGUIAPIKEY", &corev1.EnvVarSource{
+		FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"},
+	})
+}
+
+func ensureContainerVolumeMount(ctr *corev1.Container, name string, path string) *corev1.VolumeMount {
+	for _, v := range ctr.VolumeMounts {
+		if v.Name == name {
+			if path != "" {
+				v.MountPath = path
+			}
+			return &v
+		}
+	}
+	ctr.VolumeMounts = append(ctr.VolumeMounts, corev1.VolumeMount{Name: name, MountPath: path})
+	return &ctr.VolumeMounts[len(ctr.VolumeMounts)-1]
+}
+
+func ensureCSIDriverContainer(c *stc.SyncthingCluster, a *appsv1.DaemonSet) {
+	ctr := ensurePodContainer(&a.Spec.Template.Spec, "stc-csi")
+	if ctr.Image == "" {
+		ctr.Image = os.Getenv("IMAGE")
+	}
+	if ctr.SecurityContext == nil {
+		ctr.SecurityContext = &corev1.SecurityContext{}
+	}
+	ctr.SecurityContext.Privileged = pointer.Bool(true)
+	ensureContainerSTGUIAPIKEY(ctr)
+	ensureContainerEnvValueFrom(ctr, "NODE_NAME", &corev1.EnvVarSource{
+		FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"},
+	})
+	ensureContainerEnvValue(ctr, "ENDPOINT", "127.0.0.1:8384")
+	ensureContainerEnvValue(ctr, "DRIVER_NAME", string(c.UID)+".stc.samcday.com")
+	ensureContainerEnvValue(ctr, "CSI_SOCKET", "/run/csi/socket")
+
+	ensureContainerVolumeMount(ctr, "syncthing-data", "/var/syncthing")
+	ensureContainerVolumeMount(ctr, "csi", "/run/csi")
+	ensureContainerVolumeMount(ctr, "dev", "/dev")
+	mnt := ensureContainerVolumeMount(ctr, "kubelet", "/var/lib/kubelet")
+	mp := corev1.MountPropagationBidirectional
+	mnt.MountPropagation = &mp
+}
+
+func ensureNodeRegistrarContainer(c *stc.SyncthingCluster, a *appsv1.DaemonSet) {
+	ctr := ensurePodContainer(&a.Spec.Template.Spec, "csi-node-driver-registrar")
+	if ctr.Image == "" {
+		ctr.Image = "registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.7.0"
+	}
+	ctr.Args = append(ctr.Args, fmt.Sprintf("--kubelet-registration-path=/var/lib/kubelet/plugins/%s.stc.samcday.com/socket", c.UID))
+	ensureContainerVolumeMount(ctr, "csi", "/run/csi")
+	ensureContainerVolumeMount(ctr, "registration", "/registration")
+}
+
+func (r *SyncthingClusterReconciler) ensureStorageClass(ctx context.Context, log logr.Logger, c *stc.SyncthingCluster) error {
+	var sc storagev1.StorageClass
+	className := storageClassName(c)
+	driverName := csiDriverName(c)
+	err := r.Get(ctx, types.NamespacedName{Name: className}, &sc)
+	if err != nil && !k8serr.IsNotFound(err) {
+		return err
+	}
+	exists := sc.Name != ""
+	patch := client.MergeFrom(sc.DeepCopy())
+	sc.Name = className
+	sc.Provisioner = driverName
+	vbm := storagev1.VolumeBindingWaitForFirstConsumer
+	sc.VolumeBindingMode = &vbm
+	sc.AllowedTopologies = []corev1.TopologySelectorTerm{{
+		MatchLabelExpressions: []corev1.TopologySelectorLabelRequirement{{
+			Key:    "cluster.stc.samcday.com/" + string(c.UID),
+			Values: []string{""},
+		}},
+	}}
+	if exists {
+		return r.Patch(ctx, &sc, patch)
+	} else {
+		return r.Create(ctx, &sc)
+	}
+}
+
+func csiDriverName(c *stc.SyncthingCluster) string {
+	return fmt.Sprintf("%s.stc.samcday.com", c.UID)
+}
+
+func storageClassName(c *stc.SyncthingCluster) string {
+	if c.Spec.StorageClassName != "" {
+		return c.Spec.StorageClassName
+	}
+	return fmt.Sprintf("syncthing-%s-%s", c.Namespace, c.Name)
+}
+
+func (r *SyncthingClusterReconciler) ensureCSIDriver(ctx context.Context, log logr.Logger, c *stc.SyncthingCluster) error {
+	var driver storagev1.CSIDriver
+	driverName := csiDriverName(c)
+	err := r.Get(ctx, types.NamespacedName{Name: driverName}, &driver)
+	if err != nil && !k8serr.IsNotFound(err) {
+		return err
+	}
+	exists := driver.Name != ""
+	patch := client.MergeFrom(driver.DeepCopy())
+	driver.Name = driverName
+	driver.Spec.AttachRequired = pointer.Bool(false)
+	driver.Spec.VolumeLifecycleModes = []storagev1.VolumeLifecycleMode{storagev1.VolumeLifecyclePersistent}
+	if exists {
+		return r.Patch(ctx, &driver, patch)
+	} else {
+		return r.Create(ctx, &driver)
+	}
 }
 
 func (r *SyncthingClusterReconciler) updateReadiness(log logr.Logger, ctx context.Context, c *stc.SyncthingCluster, isReady bool, reason, message string) error {

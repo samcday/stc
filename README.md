@@ -1,12 +1,9 @@
 # syncthing-controller (stc)
 
-Create a `SyncthingCluster` in your Kubernetes:
+Manage a cluster of Syncthing devices in your Kubernetes cluster. Use those clusters as persistent volume storage.
+
+In development.
 
 ```sh
-make install
-make run
-
-kubectl apply -f config/samples/
-kubectl wait syncthingcluster syncthingcluster-sample --for=condition=Ready
-kubectl get -o yaml syncthingcluster syncthingcluster-sample
+skaffold dev -p dev,cluster
 ```

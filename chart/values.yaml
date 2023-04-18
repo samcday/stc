@@ -16,6 +16,9 @@ containerSpec:
   command:
     - /bin/stc
     - -config=/config/config.yaml
+  env:
+    - name: IMAGE
+      value: "{{ $.Values.containerSpec.image }}"
   livenessProbe:
     httpGet:
       path: /healthz
@@ -38,6 +41,7 @@ containerSpec:
       mountPath: /config
 imagePullSecrets: []
 nameOverride: ""
+nodeSelector: ~
 podAnnotations: {}
 podSecurityContext: {}
 fullnameOverride: ""
@@ -45,3 +49,10 @@ serviceAccount:
   create: true
   annotations: {}
   name: ""
+defaultCluster:
+  enabled: false
+  metadata:
+    name: '{{ include "stc.fullname" . }}'
+  spec:
+    podSpec:
+      containers: []
