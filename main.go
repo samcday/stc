@@ -168,8 +168,7 @@ func configureFolder(cfg *stconfig.Configuration, name string) *stconfig.FolderC
 }
 
 func (d Driver) NodeUnpublishVolume(ctx context.Context, request *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
-	// No-op. If this is the last time this volume will be active on this device, so be it.
-	// Eventually the main stc controller will garbage-collect stale folders.
+	// TODO: unmount
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
@@ -294,6 +293,13 @@ func main() {
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "SyncthingCluster")
+		os.Exit(1)
+	}
+	if err = (&controllers.PVCReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "PVCReconciler")
 		os.Exit(1)
 	}
 	//+kubebuilder:scaffold:builder
