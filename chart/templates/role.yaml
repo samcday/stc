@@ -20,8 +20,6 @@ rules:
   resources:
   - persistentvolumeclaims
   verbs:
-  - create
-  - delete
   - get
   - list
   - patch
