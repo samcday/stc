@@ -519,6 +519,11 @@ func ensureCSIDriverContainer(c *stc.SyncthingCluster, a *appsv1.DaemonSet) {
 	ensureContainerEnvValue(ctr, "DRIVER_NAME", string(c.UID)+".stc.samcday.com")
 	ensureContainerEnvValue(ctr, "CSI_SOCKET", "/run/csi/socket")
 
+	var devices []string
+	for _, v := range c.Status.Nodes {
+		devices = append(devices, v.DeviceID)
+	}
+
 	mp := corev1.MountPropagationBidirectional
 	mnt := ensureContainerVolumeMount(ctr, "syncthing-data", "/var/syncthing")
 	mnt.MountPropagation = &mp
@@ -552,12 +557,6 @@ func (r *SyncthingClusterReconciler) ensureStorageClass(ctx context.Context, log
 	sc.Provisioner = driverName
 	vbm := storagev1.VolumeBindingWaitForFirstConsumer
 	sc.VolumeBindingMode = &vbm
-	sc.AllowedTopologies = []corev1.TopologySelectorTerm{{
-		MatchLabelExpressions: []corev1.TopologySelectorLabelRequirement{{
-			Key:    "cluster.stc.samcday.com/" + string(c.UID),
-			Values: []string{""},
-		}},
-	}}
 	if exists {
 		return r.Patch(ctx, &sc, patch)
 	} else {
@@ -587,6 +586,7 @@ func (r *SyncthingClusterReconciler) ensureCSIDriver(ctx context.Context, log lo
 	patch := client.MergeFrom(driver.DeepCopy())
 	driver.Name = driverName
 	driver.Spec.AttachRequired = pointer.Bool(false)
+	driver.Spec.RequiresRepublish = pointer.Bool(true)
 	driver.Spec.VolumeLifecycleModes = []storagev1.VolumeLifecycleMode{storagev1.VolumeLifecyclePersistent}
 	if exists {
 		return r.Patch(ctx, &driver, patch)

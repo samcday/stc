@@ -10,6 +10,6 @@ RUN --mount=type=cache,id=gomod,target=/go/pkg/mod \
     CGO_ENABLED=0 GOARCH=$TARGETARCH go build -gcflags="${SKAFFOLD_GO_GCFLAGS}" -v -o stc .
 
 FROM alpine:3.13
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates findmnt
 COPY --from=builder /usr/src/app/stc /bin/
 CMD /bin/stc

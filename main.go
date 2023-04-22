@@ -27,13 +27,17 @@ import (
 	"github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/pkg/errors"
 	stconfig "github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/protocol"
 	"google.golang.org/grpc"
 	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	klog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sync"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -63,11 +67,13 @@ func init() {
 
 type Driver struct {
 	http.RoundTripper
-	Client   *http.Client
-	Name     string
-	Endpoint string
-	NodeName string
-	Log      logr.Logger
+	Client        *http.Client
+	Name          string
+	Endpoint      string
+	NodeName      string
+	Log           logr.Logger
+	Mu            sync.Mutex
+	LastPublished map[string]time.Time
 }
 
 func (d Driver) GetPluginInfo(ctx context.Context, r *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {
@@ -89,47 +95,74 @@ func (d Driver) NodeUnstageVolume(context.Context, *csi.NodeUnstageVolumeRequest
 	panic("unimplemented")
 }
 
+func runCmd(ctx context.Context, log logr.Logger, cmd string) error {
+	log.V(1).Info("running command", "cmd", cmd)
+	c := exec.CommandContext(ctx, "sh", "-c", cmd)
+	return c.Run()
+}
 func (d Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
+	d.Mu.Lock()
+	defer d.Mu.Unlock()
+	log := klog.FromContext(ctx, "volume-id", req.VolumeId)
+	log.V(2).Info("publishing volume")
+
+	//lp, ok := d.LastPublished[req.VolumeId]
+	//if ok && time.Since(lp) < 5*time.Second {
+	//	log.V(1).Info("skipping NodePublishVolume")
+	//	return &csi.NodePublishVolumeResponse{}, nil
+	//}
+
 	var cfg stconfig.Configuration
-	resp, err := d.Client.Get(fmt.Sprintf("http://%s/rest/config", d.Endpoint))
+	cfgUrl := fmt.Sprintf("http://%s/rest/config", d.Endpoint)
+	resp, err := d.Client.Get(cfgUrl)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to GET /rest/config")
+		return nil, errors.Wrap(err, "failed to GET "+cfgUrl)
 	}
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("GET /rest/config HTTP error %s", resp.Status)
-	}
-	err = json.NewDecoder(resp.Body).Decode(&cfg)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to decode JSON")
+	if resp.StatusCode != 200 && resp.StatusCode != 404 {
+		return nil, fmt.Errorf("GET %s HTTP error %s", cfgUrl, resp.Status)
+	} else if resp.StatusCode != 404 {
+		err = json.NewDecoder(resp.Body).Decode(&cfg)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to decode JSON")
+		}
 	}
 
-	folder := configureFolder(&cfg, req.VolumeId)
-
-	body, err := json.Marshal(folder)
+	err = d.configureFolder(ctx, log, &cfg, req.VolumeId)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to encode JSON")
-	}
-	resp, err = d.Client.Post(fmt.Sprintf("http://%s/rest/config/folders", d.Endpoint), "application/json", bytes.NewReader(body))
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to update Syncthing folder config for %s", req.VolumeId)
-	}
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("POST /rest/config/folders/%s HTTP error %s\n%s", req.VolumeId, resp.Status, string(b))
+		return nil, err
 	}
 
-	err = os.MkdirAll(req.TargetPath, 0755)
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to mkdir %s", req.TargetPath)
+	stat, err := os.Stat(req.TargetPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, errors.Wrapf(err, "failed to stat '%s'", req.TargetPath)
+	}
+	if stat == nil {
+		log.Info("making target dir", "path", req.TargetPath)
+		err = os.MkdirAll(req.TargetPath, 0755)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to mkdir %s", req.TargetPath)
+		}
+	} else if !stat.IsDir() {
+		return nil, errors.Errorf("path '%s' already exists and is not a directory", req.TargetPath)
 	}
 
-	args := []string{"mount", "--bind", "/var/syncthing/" + req.VolumeId, req.TargetPath}
-	cmd := exec.Command("/usr/bin/env", args...)
-	err = cmd.Run()
-	if err != nil {
-		output, _ := cmd.CombinedOutput()
-		return nil, errors.Wrapf(err, "%s failed: %s", args, output)
+	unMounted := false
+	err = runCmd(ctx, log, fmt.Sprintf("findmnt %s", req.TargetPath))
+	if exitError, ok := errors.Unwrap(err).(*exec.ExitError); ok {
+		unMounted = exitError.ExitCode() == 1
+	} else {
+		return nil, errors.Wrap(err, "findmnt failed")
 	}
+	if unMounted {
+		log.Info("mounting volume")
+		err = runCmd(ctx, log, fmt.Sprintf("mount --bind /var/syncthing/%s %s", req.VolumeId, req.TargetPath))
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to mount")
+		}
+	}
+
+	d.LastPublished[req.VolumeId] = time.Now()
+
 	// Wait until all known devices are online
 	// Wait until all devices have been seen more recently than publish start time.
 	// Wait until folder last sync time is > publish start time.
@@ -138,37 +171,38 @@ func (d Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolum
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
-func configureFolder(cfg *stconfig.Configuration, name string) *stconfig.FolderConfiguration {
-	folder, _, _ := cfg.Folder(name)
+func (d Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
+	d.Mu.Lock()
+	defer d.Mu.Unlock()
+	log := klog.FromContext(ctx, "req", req)
+	log.Info("unpublishing volume")
 
-	// Folder should be offered to all other devices.
-	for _, dev := range cfg.Devices {
-		folder.Devices = append(folder.Devices, stconfig.FolderDeviceConfiguration{DeviceID: dev.DeviceID})
+	mounted := true
+	err := runCmd(ctx, log, fmt.Sprintf("findmnt %s", req.TargetPath))
+	if err != nil {
+		mounted = false
 	}
 
-	folder.ID = name
-	folder.Path = "~/" + name
+	if mounted {
+		err := runCmd(ctx, log, fmt.Sprintf("umount %s", req.TargetPath))
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to stat '%s'", req.TargetPath)
+		}
+	}
 
-	// Folder should send and receive ownership and extra metadata
-	folder.SyncOwnership = true
-	folder.SendOwnership = true
-	folder.SendXattrs = true
-	folder.SyncXattrs = true
+	stat, err := os.Stat(req.TargetPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, errors.Wrapf(err, "failed to stat '%s'", req.TargetPath)
+	}
+	if stat != nil {
+		log.Info("deleting target dir", "path", req.TargetPath)
+		err = os.Remove(req.TargetPath)
+		if err != nil && !os.IsNotExist(err) {
+			return nil, errors.Wrapf(err, "failed to rmdir %s", req.TargetPath)
+		}
+	}
 
-	// Watch the filesystem for changes, react within 1 second. Do a full folder scan every 10 minutes.
-	// These aggressive defaults will likely result in requests to make this configurable before long.
-	folder.FSWatcherEnabled = true
-	folder.FSWatcherDelayS = 1
-	folder.RescanIntervalS = 600
-
-	// With LIFO sync order I can imagine building some simple sync primitives on top of these semantics.
-	// Seems it'd be more friendly to an eventually-consistent shared filesystem view, if RWX were to be supported.
-	folder.Order = stconfig.PullOrderOldestFirst
-	return &folder
-}
-
-func (d Driver) NodeUnpublishVolume(ctx context.Context, request *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
-	// TODO: unmount
+	delete(d.LastPublished, req.VolumeId)
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
@@ -200,6 +234,66 @@ type SyncthingTransport struct {
 func (d SyncthingTransport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
 	req.Header.Set("X-API-Key", d.APIKey)
 	return d.Transport.RoundTrip(req)
+}
+
+func (d Driver) configureFolder(ctx context.Context, log logr.Logger, cfg *stconfig.Configuration, name string) error {
+	folder, _, _ := cfg.Folder(name)
+	clone := folder.Copy()
+	// Folder should be offered to all other devices.
+	for _, device := range cfg.Devices {
+		found := false
+		for _, v := range folder.Devices {
+			if v.DeviceID == device.DeviceID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			folder.Devices = append(folder.Devices, stconfig.FolderDeviceConfiguration{DeviceID: device.DeviceID})
+		}
+	}
+
+	folder.ID = name
+	folder.Path = "~/" + name
+
+	// Folder should send and receive ownership and extra metadata
+	folder.SyncOwnership = true
+	folder.SendOwnership = true
+	folder.SendXattrs = true
+	folder.SyncXattrs = true
+
+	// Watch the filesystem for changes, react within 1 second. Do a full folder scan every 10 minutes.
+	// These aggressive defaults will likely result in requests to make this configurable before long.
+	folder.FSWatcherEnabled = true
+	folder.FSWatcherDelayS = 1
+	folder.RescanIntervalS = 600
+
+	// With LIFO sync order I can imagine building some simple sync primitives on top of these semantics.
+	// Seems it'd be more friendly to an eventually-consistent shared filesystem view, if RWX were to be supported.
+	folder.Order = stconfig.PullOrderOldestFirst
+
+	if clone.String() != folder.String() {
+		log.Info("updating folder configuration")
+		body, err := json.Marshal(folder)
+		if err != nil {
+			return errors.Wrap(err, "failed to encode JSON")
+		}
+		folderUrl := fmt.Sprintf("http://%s/rest/config/folders/%s", d.Endpoint, name)
+		r, err := http.NewRequestWithContext(ctx, "PUT", folderUrl, bytes.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		if err != nil {
+			return errors.Wrap(err, "failed to create request")
+		}
+		resp, err := d.Client.Do(r)
+		if err != nil {
+			return errors.Wrapf(err, "failed to update Syncthing folder config for %s", name)
+		}
+		if resp.StatusCode != 200 {
+			b, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("POST /rest/config/folders/%s HTTP error %s\n%s", name, resp.Status, string(b))
+		}
+	}
+	return nil
 }
 
 //+kubebuilder:rbac:namespace="{{$.Release.Namespace}}",groups="coordination.k8s.io",resources=leases,verbs=get;list;watch;create;update;patch;delete
@@ -245,12 +339,13 @@ func main() {
 			return handler(ctx, req)
 		}))
 		driver := &Driver{
-			Log:          log,
-			Endpoint:     endpoint,
-			RoundTripper: http.DefaultTransport,
-			Client:       &http.Client{Transport: &SyncthingTransport{APIKey: apiKey, Transport: http.DefaultTransport}},
-			Name:         driverName,
-			NodeName:     nodeName,
+			Log:           log,
+			Endpoint:      endpoint,
+			RoundTripper:  http.DefaultTransport,
+			Client:        &http.Client{Transport: &SyncthingTransport{APIKey: apiKey, Transport: http.DefaultTransport}},
+			Name:          driverName,
+			NodeName:      nodeName,
+			LastPublished: map[string]time.Time{},
 		}
 		csi.RegisterIdentityServer(server, driver)
 		csi.RegisterNodeServer(server, driver)
@@ -318,4 +413,12 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+func mustDID(raw string) protocol.DeviceID {
+	did, err := protocol.DeviceIDFromString(raw)
+	if err != nil {
+		panic(err)
+	}
+	return did
 }
