@@ -32,8 +32,6 @@ spec:
             type: object
           spec:
             properties:
-              StorageClassName:
-                type: string
               devices:
                 additionalProperties:
                   properties:
@@ -6935,6 +6933,8 @@ spec:
                 required:
                 - containers
                 type: object
+              storageClassName:
+                type: string
             type: object
           status:
             properties:
