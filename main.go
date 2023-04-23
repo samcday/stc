@@ -30,6 +30,7 @@ import (
 	"github.com/syncthing/syncthing/lib/protocol"
 	"google.golang.org/grpc"
 	"io"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"net"
 	"net/http"
 	"os"
@@ -102,6 +103,7 @@ func runCmd(ctx context.Context, log logr.Logger, cmd string) error {
 }
 func (d Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
 	d.Mu.Lock()
+	start := time.Now()
 	defer d.Mu.Unlock()
 	log := klog.FromContext(ctx, "volume-id", req.VolumeId)
 	log.V(2).Info("publishing volume")
@@ -146,11 +148,88 @@ func (d Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolum
 		return nil, errors.Errorf("path '%s' already exists and is not a directory", req.TargetPath)
 	}
 
+	var status struct {
+		MyID string `json:"myID"`
+	}
+	statusUrl := fmt.Sprintf("http://%s/rest/system/status", d.Endpoint)
+	resp, err = d.Client.Get(statusUrl)
+	if err == nil && resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP error %s", resp.Status)
+	}
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to GET "+statusUrl)
+	}
+	err = json.NewDecoder(resp.Body).Decode(&status)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to decode JSON")
+	}
+
+	err = wait.Poll(time.Second, time.Second*30, func() (done bool, err error) {
+		var deviceStatus map[string]struct {
+			LastSeen time.Time `json:"lastSeen"`
+		}
+		url := fmt.Sprintf("http://%s/rest/stats/device", d.Endpoint)
+		resp, err = d.Client.Get(url)
+		if err == nil && resp.StatusCode != 200 {
+			err = fmt.Errorf("HTTP error %s", resp.Status)
+		}
+		if err != nil {
+			err = errors.Wrap(err, "failed to GET "+url)
+			return
+		}
+		err = json.NewDecoder(resp.Body).Decode(&deviceStatus)
+		if err != nil {
+			err = errors.Wrap(err, "failed to decode JSON")
+			return
+		}
+
+		done = true
+		for id, v := range deviceStatus {
+			if id == status.MyID {
+				continue
+			}
+			if v.LastSeen.Before(start) {
+				done = false
+				break
+			}
+		}
+		return
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to wait for device readiness")
+	}
+
+	// Wait until folder reports 100% completion
+	err = wait.Poll(time.Second, time.Second*30, func() (done bool, err error) {
+		var completion struct {
+			Completion float64 `json:"completion"`
+		}
+		url := fmt.Sprintf("http://%s/rest/db/completion?folder=%s", d.Endpoint, req.VolumeId)
+		resp, err = d.Client.Get(url)
+		if err == nil && resp.StatusCode != 200 {
+			err = fmt.Errorf("HTTP error %s", resp.Status)
+		}
+		if err != nil {
+			err = errors.Wrap(err, "failed to GET "+url)
+			return
+		}
+		err = json.NewDecoder(resp.Body).Decode(&completion)
+		if err != nil {
+			err = errors.Wrap(err, "failed to decode JSON")
+			return
+		}
+		done = completion.Completion == 100
+		return
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to wait for folder readiness")
+	}
+
 	unMounted := false
 	err = runCmd(ctx, log, fmt.Sprintf("findmnt %s", req.TargetPath))
-	if exitError, ok := errors.Unwrap(err).(*exec.ExitError); ok {
+	if exitError, ok := err.(*exec.ExitError); ok {
 		unMounted = exitError.ExitCode() == 1
-	} else {
+	} else if err != nil {
 		return nil, errors.Wrap(err, "findmnt failed")
 	}
 	if unMounted {
@@ -162,11 +241,6 @@ func (d Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolum
 	}
 
 	d.LastPublished[req.VolumeId] = time.Now()
-
-	// Wait until all known devices are online
-	// Wait until all devices have been seen more recently than publish start time.
-	// Wait until folder last sync time is > publish start time.
-	// Done.
 
 	return &csi.NodePublishVolumeResponse{}, nil
 }
