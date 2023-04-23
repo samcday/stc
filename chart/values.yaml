@@ -11,7 +11,7 @@ config:
     leaderElectionReleaseOnCancel: true
 containerSpec:
   name: "{{ .Chart.Name }}"
-  image: samcday/stc
+  image: ghcr.io/samcday/stc
   imagePullPolicy: IfNotPresent
   command:
     - /bin/stc

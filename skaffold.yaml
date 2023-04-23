@@ -4,7 +4,7 @@ metadata:
   name: stc
 build:
   artifacts:
-    - image: samcday/stc
+    - image: ghcr.io/samcday/stc
       docker:
         dockerfile: Dockerfile
       hooks:
@@ -23,7 +23,7 @@ manifests:
             readinessProbe.initialDelaySeconds: 1
         setValueTemplates:
           containerSpec:
-            image: "{{.IMAGE_REPO_samcday_stc}}:{{.IMAGE_TAG_samcday_stc}}@{{.IMAGE_DIGEST_samcday_stc}}"
+            image: "{{.IMAGE_REPO_ghcr_io_samcday_stc}}:{{.IMAGE_TAG_ghcr_io_samcday_stc}}@{{.IMAGE_DIGEST_ghcr_io_samcday_stc}}"
 deploy:
   helm:
     hooks:
