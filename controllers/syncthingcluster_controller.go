@@ -377,22 +377,25 @@ func (r *SyncthingClusterReconciler) ensureDaemonSet(log logr.Logger, ctx contex
 		ctr.Image = "syncthing/syncthing:1"
 	}
 
-	if ctr.SecurityContext == nil {
-		ctr.SecurityContext = &corev1.SecurityContext{}
-	}
-	if ctr.SecurityContext.Capabilities == nil {
-		ctr.SecurityContext.Capabilities = &corev1.Capabilities{}
-	}
-	ensureCap := func(caps *corev1.Capabilities, name string) {
-		for _, c := range caps.Add {
-			if string(c) == name {
-				return
-			}
-		}
-		caps.Add = append(caps.Add, corev1.Capability(name))
-	}
-	ensureCap(ctr.SecurityContext.Capabilities, "CHOWN")
-	ensureCap(ctr.SecurityContext.Capabilities, "FOWNER")
+	// TODO: this was resulting in permission denied" issues during folder sync
+	// So for now syncthing is run as root inside the container.
+	ctr.Command = []string{"/bin/syncthing", "-home", "/var/syncthing/config"}
+	//if ctr.SecurityContext == nil {
+	//	ctr.SecurityContext = &corev1.SecurityContext{}
+	//}
+	//if ctr.SecurityContext.Capabilities == nil {
+	//	ctr.SecurityContext.Capabilities = &corev1.Capabilities{}
+	//}
+	//ensureCap := func(caps *corev1.Capabilities, name string) {
+	//	for _, c := range caps.Add {
+	//		if string(c) == name {
+	//			return
+	//		}
+	//	}
+	//	caps.Add = append(caps.Add, corev1.Capability(name))
+	//}
+	//ensureCap(ctr.SecurityContext.Capabilities, "CHOWN")
+	//ensureCap(ctr.SecurityContext.Capabilities, "FOWNER")
 
 	// Ensure syncthing container has a /var/syncthing volume mount referencing syncthing-data volume.
 	ensureContainerVolumeMount(ctr, "syncthing-data", "/var/syncthing")
