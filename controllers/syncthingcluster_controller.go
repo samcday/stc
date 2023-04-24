@@ -211,9 +211,8 @@ func (r *SyncthingClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 					return ctrl.Result{}, err
 				}
 				if completion.GlobalItems > 0 || completion.GlobalBytes > 0 {
-					return ctrl.Result{}, r.updateReadiness(log, ctx, &c, false,
-						"Deleting", fmt.Sprintf("Node %s (%s) still has %d local files / %d local bytes",
-							name, v.DeviceID, completion.GlobalItems, completion.GlobalBytes))
+					return ctrl.Result{}, r.updateReadiness(ctx, log, &c, false, "Deleting", fmt.Sprintf("Node %s (%s) still has %d local files / %d local bytes",
+						name, v.DeviceID, completion.GlobalItems, completion.GlobalBytes))
 				}
 			}
 
@@ -244,7 +243,7 @@ func (r *SyncthingClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			controllerutil.RemoveFinalizer(&c, finalizerName)
 			return ctrl.Result{}, r.Update(ctx, &c)
 		} else {
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, r.updateReadiness(log, ctx, &c, false, "Deleting", "Waiting for cluster to be ready, before deleting it")
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, r.updateReadiness(ctx, log, &c, false, "Deleting", "Waiting for cluster to be ready, before deleting it")
 		}
 	}
 
@@ -268,7 +267,7 @@ func (r *SyncthingClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		result = reconcile.Result{RequeueAfter: time.Minute}
 	}
 
-	err = r.updateReadiness(log, ctx, &c, isReady, reason, message)
+	err = r.updateReadiness(ctx, log, &c, isReady, reason, message)
 	if err != nil {
 		return reconcile.Result{}, errors.Wrap(err, "failed to update readiness")
 	}
@@ -299,8 +298,7 @@ func (r *SyncthingClusterReconciler) ensureDaemonSet(log logr.Logger, ctx contex
 
 	owner := metav1.GetControllerOf(&ds)
 	if dsExists && (owner == nil || owner.APIVersion != stc.GroupVersion.String() || owner.Kind != c.Kind) {
-		return nil, r.updateReadiness(log, ctx, c, false,
-			"Error", fmt.Sprintf("An unmanaged DaemonSet with the name '%s' already exists", dsName))
+		return nil, r.updateReadiness(ctx, log, c, false, "Error", fmt.Sprintf("An unmanaged DaemonSet with the name '%s' already exists", dsName))
 	}
 
 	// Ensure baseline DaemonSet metadata (name, namespace, label selector, pod template from config)
@@ -420,7 +418,7 @@ func (r *SyncthingClusterReconciler) ensureDaemonSet(log logr.Logger, ctx contex
 
 	dss := ds.Status
 	if dss.ObservedGeneration < ds.Generation || dss.NumberReady < dss.DesiredNumberScheduled || dss.UpdatedNumberScheduled < dss.DesiredNumberScheduled {
-		return nil, r.updateReadiness(log, ctx, c, false, "DaemonSetNotUpToDate", "DaemonSet has not fully rolled out yet")
+		return nil, r.updateReadiness(ctx, log, c, false, "DaemonSetNotUpToDate", "DaemonSet has not fully rolled out yet")
 	}
 
 	return &ds, nil
@@ -587,15 +585,16 @@ func (r *SyncthingClusterReconciler) ensureCSIDriver(ctx context.Context, log lo
 	driver.Name = driverName
 	driver.Spec.AttachRequired = pointer.Bool(false)
 	driver.Spec.RequiresRepublish = pointer.Bool(true)
+	fsgp := storagev1.FileFSGroupPolicy
+	driver.Spec.FSGroupPolicy = &fsgp
 	driver.Spec.VolumeLifecycleModes = []storagev1.VolumeLifecycleMode{storagev1.VolumeLifecyclePersistent}
 	if exists {
 		return r.Patch(ctx, &driver, patch)
-	} else {
-		return r.Create(ctx, &driver)
 	}
+	return r.Create(ctx, &driver)
 }
 
-func (r *SyncthingClusterReconciler) updateReadiness(log logr.Logger, ctx context.Context, c *stc.SyncthingCluster, isReady bool, reason, message string) error {
+func (r *SyncthingClusterReconciler) updateReadiness(ctx context.Context, log logr.Logger, c *stc.SyncthingCluster, isReady bool, reason, message string) error {
 	readyStatus := metav1.ConditionFalse
 	if isReady {
 		readyStatus = metav1.ConditionTrue
@@ -643,10 +642,11 @@ func (r *SyncthingClusterReconciler) syncthingStatus(client *http.Client, ip str
 	}
 	nodeStatus.DeviceID = statusResp.ID
 
-	_, err = stAPI(client, ip, "stats/device", &deviceResp)
+	resp, err := stAPI(client, ip, "stats/device", &deviceResp)
 	if err != nil {
 		return
 	}
+	defer resp.Body.Close()
 	for k, v := range deviceResp {
 		if k == nodeStatus.DeviceID {
 			continue

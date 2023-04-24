@@ -164,7 +164,7 @@ func (d Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolum
 		return nil, errors.Wrap(err, "failed to decode JSON")
 	}
 
-	err = wait.Poll(time.Second, time.Second*30, func() (done bool, err error) {
+	err = wait.Poll(time.Second, time.Minute*2, func() (done bool, err error) {
 		var deviceStatus map[string]struct {
 			LastSeen time.Time `json:"lastSeen"`
 		}
@@ -200,7 +200,7 @@ func (d Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolum
 	}
 
 	// Wait until folder reports 100% completion
-	err = wait.Poll(time.Second, time.Second*30, func() (done bool, err error) {
+	err = wait.Poll(time.Second, time.Minute*2, func() (done bool, err error) {
 		var completion struct {
 			Completion float64 `json:"completion"`
 		}
