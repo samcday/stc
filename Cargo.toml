@@ -1,0 +1,27 @@
+[package]
+name = "stc"
+version = "0.1.0"
+edition = "2021"
+default-run = "controller"
+
+[[bin]]
+name = "controller"
+path = "src/main.rs"
+
+[[bin]]
+name = "crdgen"
+path = "src/crdgen.rs"
+
+[dependencies]
+anyhow = "1.0.72"
+futures = "0.3.28"
+k8s-openapi = { version = "0.18.0", features = ["v1_26"] }
+kube = { version = "0.84.0", features = ["runtime", "ws", "client", "kube-derive", "derive"] }
+schemars = "0.8.12"
+serde = "1.0.174"
+serde_json = "1.0.103"
+serde_yaml = "0.9.25"
+thiserror = "1.0.44"
+tokio = { version = "1.29.1", features = ["full"] }
+tracing = "0.1.37"
+tracing-subscriber = "0.3.17"
