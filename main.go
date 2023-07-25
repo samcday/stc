@@ -22,6 +22,14 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"sync"
+	"time"
+
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/go-logr/logr"
 	"github.com/golang/protobuf/ptypes/wrappers"
@@ -29,16 +37,9 @@ import (
 	stconfig "github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"google.golang.org/grpc"
-	"io"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"net"
-	"net/http"
-	"os"
-	"os/exec"
 	klog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	"sync"
-	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -336,11 +337,9 @@ func (d Driver) configureFolder(ctx context.Context, log logr.Logger, cfg *stcon
 	folder.SendXattrs = true
 	folder.SyncXattrs = true
 
-	// Watch the filesystem for changes, react within 1 second. Do a full folder scan every 10 minutes.
-	// These aggressive defaults will likely result in requests to make this configurable before long.
 	folder.FSWatcherEnabled = true
-	folder.FSWatcherDelayS = 1
-	folder.RescanIntervalS = 600
+	folder.FSWatcherDelayS = 10
+	folder.RescanIntervalS = 3600
 
 	// With LIFO sync order I can imagine building some simple sync primitives on top of these semantics.
 	// Seems it'd be more friendly to an eventually-consistent shared filesystem view, if RWX were to be supported.
